@@ -1,0 +1,10 @@
+**/bin/
+**/obj/
+**/publish/
+**/publish-single/
+**/.work/
+.vs/
+*.user
+/artifacts/
+/inputs/
+/vendor/

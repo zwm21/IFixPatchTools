@@ -1,0 +1,9 @@
+{
+  "name": "example-target",
+  "targetFramework": "net471",
+  "assemblyPath": "../../inputs/DummyDll/Assembly-CSharp.dll",
+  "iFixCoreAssemblyPath": "../../inputs/DummyDll/IFix.Core.dll",
+  "referenceDirectories": [
+    "../../inputs/DummyDll"
+  ]
+}

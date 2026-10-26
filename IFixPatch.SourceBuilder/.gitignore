@@ -1,0 +1,5 @@
+bin/
+obj/
+.work/
+tools/InjectFix.Cli/bin/
+tools/InjectFix.Cli/obj/

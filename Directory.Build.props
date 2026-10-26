@@ -1,0 +1,14 @@
+<Project>
+  <PropertyGroup>
+    <Authors>cca2878</Authors>
+    <Copyright>Copyright (c) 2026 cca2878</Copyright>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <None Include="$(MSBuildThisFileDirectory)README.md" Link="README.md" Pack="true" PackagePath="" />
+    <None Include="$(MSBuildThisFileDirectory)LICENSE" Link="LICENSE" Pack="true" PackagePath="" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <None Include="$(MSBuildThisFileDirectory)THIRD_PARTY_NOTICES.md" Link="THIRD_PARTY_NOTICES.md" Pack="true" PackagePath="" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <None Include="$(MSBuildThisFileDirectory)licenses/*.txt" Link="licenses/%(Filename)%(Extension)" Pack="true" PackagePath="licenses/" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

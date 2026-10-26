@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <AssemblyName>IFix</AssemblyName>
+    <InjectFixRoot Condition="'$(InjectFixRoot)' == ''">$(MSBuildThisFileDirectory)../../../vendor/InjectFix</InjectFixRoot>
+  </PropertyGroup>
+  <Target Name="RequireGameIFixCoreSource" BeforeTargets="CoreCompile">
+    <Error Condition="'$(GameIFixCoreSource)' == ''" Text="Set GameIFixCoreSource to prepared-profile adapterCoreSourcePath." />
+    <Error Condition="!Exists('$(InjectFixRoot)/Source/VSProj/Src/Tools/CodeTranslator.cs')" Text="InjectFix source was not found. Clone the documented revision into vendor/InjectFix or pass --injectfix-root to SourceBuilder." />
+  </Target>
+  <ItemGroup>
+    <Reference Include="Mono.Cecil">
+      <HintPath>$(InjectFixRoot)/Source/VSProj/ThirdParty/Mono.Cecil.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="CoreCompatibilityGuard.cs" />
+    <Compile Include="$(GameIFixCoreSource)" Link="Generated/Instruction.g.cs" />
+    <Compile Include="$(InjectFixRoot)/Source/VSProj/Src/Tools/CSFix.cs" Link="Upstream/CSFix.cs" />
+    <Compile Include="$(InjectFixRoot)/Source/VSProj/Src/Tools/CecilExtensions.cs" Link="Upstream/CecilExtensions.cs" />
+    <Compile Include="$(InjectFixRoot)/Source/VSProj/Src/Tools/CodeTranslator.cs" Link="Upstream/CodeTranslator.cs" />
+    <Compile Include="$(InjectFixRoot)/Source/VSProj/Src/Tools/GenerateConfigure.cs" Link="Upstream/GenerateConfigure.cs" />
+    <Compile Include="$(InjectFixRoot)/Source/VSProj/Src/Version.cs" Link="Upstream/Version.cs" />
+  </ItemGroup>
+</Project>

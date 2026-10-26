@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../IFixPatch.Core/IFixPatch.Core.csproj" />
+    <ProjectReference Include="../../IFixPatch.SourceBuilder.Core/IFixPatch.SourceBuilder.Core.csproj" />
+    <ProjectReference Include="../../IFixPatch.SourceBuilder/IFixPatch.SourceBuilder.csproj" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="../../IFixPatch.Decompiler/IFixPatch.Decompiler.csproj" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="../../IFixPatch.Recompiler/IFixPatch.Recompiler.csproj" ReferenceOutputAssembly="false" />
+  </ItemGroup>
+</Project>

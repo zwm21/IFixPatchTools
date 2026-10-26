@@ -1,0 +1,13 @@
+{
+  "name": "calculator-example",
+  "assemblyName": "CalculatorPatch",
+  "sources": [
+    "PatchImpl.cs"
+  ],
+  "patches": [
+    {
+      "target": "System.Int32 Example.Calculator::Add(System.Int32)",
+      "implementation": "System.Int32 ExamplePatch.PatchImpl::Add(Example.Calculator,System.Int32)"
+    }
+  ]
+}
