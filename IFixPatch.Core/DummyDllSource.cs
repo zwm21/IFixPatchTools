@@ -3,18 +3,15 @@ using Mono.Cecil;
 namespace IFixPatch.Core;
 
 /// <summary>
-/// 从 Il2CppDumper 的 DummyDll 目录读元数据。相对 dump.cs 的决定性优势是类型带完整身份
-/// （命名空间 + 程序集），dump.cs 的签名只有短名且大量重名，无法可靠消歧。
-///
-/// 针对「文件集」的稳健性处理：
-///   · 按需加载：AQN 自带程序集名，只打开用到的那个（Assembly-CSharp.dll 有 56MB，不预加载全部）。
-///   · 依赖解析：DefaultAssemblyResolver + 目录搜索路径；解析不到不抛，降级并记录。
-///   · 缺文件容错：IFix.Core.dll 缺失只影响 opcode 映射，其余功能照常。
+/// 从 Il2CppDumper 的 DummyDll 目录读取带命名空间和程序集身份的元数据。
+/// 按 AQN 按需加载程序集，并通过目录搜索解析依赖。
+/// 缺失或无法读取的程序集记录为警告；依赖其类型的查询返回未解析结果。
 /// </summary>
 public sealed class DummyDllSource : IMetadataSource, IDisposable
 {
     private readonly string _dir;
-    private readonly DefaultAssemblyResolver _resolver;
+    private readonly MetadataResolver _resolver;
+    private readonly List<string> _directories;
     private readonly Dictionary<string, AssemblyDefinition?> _byAssemblyName = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, TypeDefinition?> _typeCache = [];
     private readonly List<string> _warnings = [];
@@ -27,18 +24,46 @@ public sealed class DummyDllSource : IMetadataSource, IDisposable
 
     /// <summary>DummyDll 目录；反编译器的解析器也必须搜索它，否则类型全部退化为 Unknown。</summary>
     public string DllDirectory => _dir;
+    public IReadOnlyList<string> DllDirectories => _directories;
 
-    public DummyDllSource(string dir)
+    public DummyDllSource(string dir) : this([dir]) { }
+
+    /// <summary>Explicit assemblies are indexed by metadata identity even when their file names differ.</summary>
+    public DummyDllSource(IEnumerable<string> directories, IEnumerable<string>? explicitAssemblies = null)
     {
-        _dir = dir;
-        _resolver = new DefaultAssemblyResolver();
-        _resolver.AddSearchDirectory(dir);
+        _directories = directories.Select(Path.GetFullPath).Distinct(StringComparer.Ordinal).ToList();
+        if (_directories.Count == 0) throw new ArgumentException("At least one metadata directory is required.");
+        _dir = _directories[0];
+        _resolver = new MetadataResolver();
+        foreach (var directory in _directories) _resolver.AddSearchDirectory(directory);
+        try
+        {
+            foreach (var path in (explicitAssemblies ?? []).Select(Path.GetFullPath).Distinct(StringComparer.Ordinal))
+            {
+                var assembly = _resolver.LoadFile(path);
+                if (_byAssemblyName.TryGetValue(assembly.Name.Name, out var previous))
+                    throw new InvalidDataException("Duplicate explicit metadata assembly: " + assembly.Name.Name);
+                _byAssemblyName.Add(assembly.Name.Name, assembly);
+            }
+        }
+        catch { _resolver.Dispose(); throw; }
+    }
+
+    private sealed class MetadataResolver : DefaultAssemblyResolver
+    {
+        public AssemblyDefinition LoadFile(string path)
+        {
+            var assembly = AssemblyDefinition.ReadAssembly(path,
+                new ReaderParameters { AssemblyResolver = this, ReadingMode = ReadingMode.Deferred });
+            RegisterAssembly(assembly);
+            return assembly;
+        }
     }
 
     public string Describe()
     {
         int loaded = _byAssemblyName.Values.Count(a => a != null);
-        int available = Directory.Exists(_dir) ? Directory.GetFiles(_dir, "*.dll").Length : 0;
+        int available = _directories.Where(Directory.Exists).Sum(directory => Directory.GetFiles(directory, "*.dll").Length);
         return $"DummyDll ({available} 个程序集可用，已按需加载 {loaded})";
     }
 
@@ -46,16 +71,17 @@ public sealed class DummyDllSource : IMetadataSource, IDisposable
     {
         if (_byAssemblyName.TryGetValue(assemblyShortName, out var cached)) return cached;
 
-        var path = Path.Combine(_dir, assemblyShortName + ".dll");
+        var path = _directories.Select(directory => Path.Combine(directory, assemblyShortName + ".dll")).FirstOrDefault(File.Exists);
         AssemblyDefinition? asm = null;
-        if (File.Exists(path))
+        if (path is not null)
         {
             try
             {
-                asm = AssemblyDefinition.ReadAssembly(path,
-                    new ReaderParameters { AssemblyResolver = _resolver, ReadingMode = ReadingMode.Deferred });
+                asm = _resolver.LoadFile(path);
+                if (!StringComparer.OrdinalIgnoreCase.Equals(asm.Name.Name, assemblyShortName))
+                    throw new InvalidDataException("Metadata assembly identity differs from requested name: " + assemblyShortName);
             }
-            catch (Exception e) { _warnings.Add($"读取 {assemblyShortName}.dll 失败: {e.Message}"); }
+            catch (Exception e) { asm = null; _warnings.Add($"读取 {assemblyShortName}.dll 失败: {e.Message}"); }
         }
         else _warnings.Add($"DummyDll 里缺少 {assemblyShortName}.dll");
 
@@ -63,7 +89,7 @@ public sealed class DummyDllSource : IMetadataSource, IDisposable
         return asm;
     }
 
-    /// <summary>由 AQN 定位 TypeDefinition。AQN 自带程序集名，故先精确定位再回退全目录扫描。</summary>
+    /// <summary>限定 AQN 只查询指定程序集；未限定类型名查询已加载的程序集。</summary>
     private TypeDefinition? ResolveType(string aqn)
     {
         if (_typeCache.TryGetValue(aqn, out var cached)) return cached;
@@ -78,9 +104,9 @@ public sealed class DummyDllSource : IMetadataSource, IDisposable
             var asm = Load(asmName);
             found = asm?.MainModule.GetType(cecilName);
         }
-        if (found == null)
+        else
         {
-            // 回退：类型可能被转发到别的程序集（type forwarding），扫已加载的
+            // 未提供程序集限定名时，才允许在已加载的类型定义中查找。
             foreach (var asm in _byAssemblyName.Values)
             {
                 if (asm == null) continue;
@@ -124,7 +150,7 @@ public sealed class DummyDllSource : IMetadataSource, IDisposable
         var t = ResolveType("IFix.Core.Code, IFix.Core");
         if (t == null)
         {
-            _warnings.Add("DummyDll 里找不到 IFix.Core.Code，无法取 opcode 映射（可改用 --opcodes）");
+            _warnings.Add("DummyDll 里找不到 IFix.Core.Code，无法取 opcode 映射（可改用 --opcode-map）");
             return null;
         }
         var pairs = t.Fields
@@ -151,7 +177,7 @@ public sealed class DummyDllSource : IMetadataSource, IDisposable
     public List<MethodDefinition>? FindDeclaredInstanceMethods(string assemblyQualifiedName)
     {
         var t = ResolveType(assemblyQualifiedName);
-        return t?.Methods.Where(m => m.IsPublic && !m.IsStatic).ToList();
+        return t?.Methods.Where(m => m.IsPublic && !m.IsStatic && !m.IsConstructor).ToList();
     }
 
     public bool TryGetReturnType(string declaringTypeAqn, string methodName, int paramCount,
@@ -179,15 +205,20 @@ public sealed class DummyDllSource : IMetadataSource, IDisposable
     /// 按参数类型精确选择重载。补丁存了每个参数的类型（ExternMethodSig.Params[].TypeId），
     /// 只按名字 + 参数个数匹配会选错重载——例如 List&lt;T&gt; 的 .ctor(int capacity) 与
     /// .ctor(IEnumerable&lt;T&gt;) 都是一个参数。expected 里的 null 表示该位不参与比较。
-    /// 找不到精确匹配时回退到按个数匹配，保持原有行为。
+    /// 已知参数类型没有匹配项时返回 null，避免静默选择签名不兼容的方法。
     /// </summary>
     public MethodDefinition? FindMethodByParamTypes(string declaringTypeAqn, string methodName,
         IReadOnlyList<string?> expected, Func<TypeReference, string> render)
+        => FindMethodByParamTypes(declaringTypeAqn, methodName, expected, render, null);
+
+    /// <summary>按参数类型和可选泛型元数选择方法；null 元数允许查询任意泛型元数。</summary>
+    public MethodDefinition? FindMethodByParamTypes(string declaringTypeAqn, string methodName,
+        IReadOnlyList<string?> expected, Func<TypeReference, string> render, int? genericParameterCount)
     {
         var t = ResolveType(declaringTypeAqn);
         if (t == null) return null;
-        var cands = t.Methods.Where(m => m.Name == methodName && m.Parameters.Count == expected.Count).ToList();
-        if (cands.Count <= 1) return cands.FirstOrDefault();
+        var cands = t.Methods.Where(m => m.Name == methodName && m.Parameters.Count == expected.Count &&
+            (genericParameterCount is null || m.GenericParameters.Count == genericParameterCount)).ToList();
 
         foreach (var c in cands)
         {
@@ -199,7 +230,7 @@ public sealed class DummyDllSource : IMetadataSource, IDisposable
             }
             if (ok) return c;
         }
-        return cands[0];
+        return null;
     }
 
     /// <summary>IL 转译用：AQN → Cecil 类型定义。</summary>
@@ -208,14 +239,12 @@ public sealed class DummyDllSource : IMetadataSource, IDisposable
     /// <summary>
     /// 按 Cecil 全名（嵌套用 '/'，泛型定义保留 `N）定位类型定义。
     /// 供 AqnResolver 用：类型名语法已由 TypeName.Parse 拆好，这里只做查找。
+    /// 显式程序集短名查找失败时返回 null；只有未限定查询才搜索其它已加载程序集。
     /// </summary>
     public TypeDefinition? FindTypeByCecilName(string cecilFullName, string? assemblyShortName)
     {
         if (assemblyShortName != null)
-        {
-            var td = Load(assemblyShortName)?.MainModule.GetType(cecilFullName);
-            if (td != null) return td;
-        }
+            return Load(assemblyShortName)?.MainModule.GetType(cecilFullName);
         foreach (var asm in _byAssemblyName.Values)
         {
             var td = asm?.MainModule.GetType(cecilFullName);
@@ -230,7 +259,7 @@ public sealed class DummyDllSource : IMetadataSource, IDisposable
 
     public void Dispose()
     {
-        foreach (var asm in _byAssemblyName.Values) asm?.Dispose();
+        _resolver.Dispose();
         _byAssemblyName.Clear();
     }
 }

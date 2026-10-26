@@ -7,7 +7,7 @@ public sealed class BalanceIssue
 {
     public string Method = "";
     public int Offset;
-    public string Kind = "";          // underflow / ret-mismatch / inconsistent
+    public string Kind = "";          // underflow / ret-mismatch / inconsistent / invalid-operand
     public string Detail = "";
     public List<string> Context = [];
 }
@@ -59,7 +59,13 @@ public static class StackBalanceCheck
             depthAt[pos] = d;
 
             var cur = ins[pos];
-            var (pop, push) = Effect(cur, m);
+            int pop, push;
+            try { (pop, push) = Effect(cur, m); }
+            catch (InvalidDataException exception)
+            {
+                issues.Add(Make(m, ins, pos, "invalid-operand", exception.Message));
+                continue;
+            }
 
             if (d - pop < 0)
             {
@@ -154,20 +160,22 @@ public static class StackBalanceCheck
     {
         if (i.OpCode == OpCodes.Ret)
             return container.ReturnType.FullName != "System.Void" ? 1 : 0;
-        if (i.Operand is IMethodSignature sig)
-        {
-            int n = sig.Parameters.Count;
-            if (i.OpCode != OpCodes.Newobj && sig.HasThis) n++;
-            return n;
-        }
-        return 0;
+        var signature = CallSignature(i);
+        int count = signature.Parameters.Count;
+        if (i.OpCode != OpCodes.Newobj && signature.HasThis) count++;
+        if (i.OpCode == OpCodes.Calli) count++;
+        return count;
+    }
+
+    private static IMethodSignature CallSignature(Instruction instruction)
+    {
+        IMethodSignature? signature = instruction.OpCode == OpCodes.Calli
+            ? instruction.Operand as CallSite : instruction.Operand as MethodReference;
+        return signature ?? throw new InvalidDataException($"{instruction.OpCode.Name} requires a method signature operand of the matching instruction kind.");
     }
 
     private static int VarPush(Instruction i)
     {
-        if (i.OpCode == OpCodes.Newobj) return 1;
-        if (i.Operand is IMethodSignature sig)
-            return sig.ReturnType.FullName != "System.Void" ? 1 : 0;
-        return 0;
+        return CallSignature(i).ReturnType.FullName != "System.Void" ? 1 : 0;
     }
 }

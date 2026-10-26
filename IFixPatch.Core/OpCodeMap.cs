@@ -18,7 +18,7 @@ public sealed class OpCodeValidation
 }
 
 /// <summary>
-/// 逐游戏的 Code 枚举整数值 → 助记符 映射。
+/// 目标运行时的 Code 枚举整数值 → 助记符映射。
 /// 这是被 ShuffleInstruction 打乱的那套编号，是让反汇编“有语义”的必需输入。
 /// 来源：Il2CppDumper 的 dump.cs（含 `public const Code Nop = N;`），或 DummyDll，或手写映射文件。
 /// </summary>
@@ -74,10 +74,14 @@ public sealed partial class OpCodeMap
     [GeneratedRegex(@"^\s*(?<name>\w+)\s*[=:]?\s*(?<val>-?0[xX][0-9a-fA-F]+|-?\d+)\s*$")]
     private static partial Regex PlainLine();
 
-    private static int ParseIntLiteral(string s) =>
-        s.StartsWith("0x", StringComparison.OrdinalIgnoreCase) || s.StartsWith("-0x", StringComparison.OrdinalIgnoreCase)
-            ? (int)long.Parse(s.Replace("0x", "").Replace("0X", ""), NumberStyles.HexNumber)
-            : int.Parse(s, CultureInfo.InvariantCulture);
+    private static int ParseIntLiteral(string value)
+    {
+        if (value.StartsWith("-0x", StringComparison.OrdinalIgnoreCase))
+            return checked((int)-(long)uint.Parse(value[3..], NumberStyles.HexNumber, CultureInfo.InvariantCulture));
+        if (value.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+            return unchecked((int)uint.Parse(value[2..], NumberStyles.HexNumber, CultureInfo.InvariantCulture));
+        return int.Parse(value, CultureInfo.InvariantCulture);
+    }
 
     /// <summary>由 (值, 名字) 对构造，供 DummyDll 等结构化来源使用。</summary>
     public static OpCodeMap FromPairs(IEnumerable<(int Value, string Name)> pairs)
@@ -128,12 +132,11 @@ public sealed partial class OpCodeMap
         }
         else
         {
-            // 回退：找任意 `public enum Code`，但要求其前 200 字符内出现 IFix.Core，否则放弃（不冒污染风险）。
-            var decl = MyRegex().Match(text);
-            if (!decl.Success) return null;
-            int from = Math.Max(0, decl.Index - 200);
-            if (!text.AsSpan(from, decl.Index - from).ToString().Contains("IFix.Core")) return null;
-            enumPos = decl.Index;
+            // 兼容直接写在 namespace 块或文件作用域命名空间内的枚举声明。
+            // 仅凭相邻文本含 IFix.Core 不能确定枚举的命名空间。
+            var declaration = NamespaceCodeDeclaration().Match(text);
+            if (!declaration.Success) return null;
+            enumPos = declaration.Groups["declaration"].Index;
         }
 
         int open = text.IndexOf('{', enumPos);
@@ -202,6 +205,6 @@ public sealed partial class OpCodeMap
         return v;
     }
 
-    [GeneratedRegex(@"public\s+enum\s+Code\b")]
-    private static partial Regex MyRegex();
+    [GeneratedRegex(@"\bnamespace\s+IFix\.Core\s*[;{]\s*(?:\[[^\]]*\]\s*)*(?<declaration>public\s+enum\s+Code\b)")]
+    private static partial Regex NamespaceCodeDeclaration();
 }

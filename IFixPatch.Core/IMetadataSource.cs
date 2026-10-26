@@ -2,7 +2,7 @@ namespace IFixPatch.Core;
 
 /// <summary>
 /// 目标程序集元数据的来源。补丁本身不自描述，需要外部元数据补齐三样东西：
-/// 被打乱的 Code 枚举、接口方法数（决定 slot 表长度）、方法返回类型（补丁未存储）。
+/// 被打乱的 Code 枚举、接口方法数（决定 slot 表长度）、外部方法返回类型。
 ///
 /// 两个实现各自独立可用，不需要同时提供：
 ///   · DumpCsSource   —— 单文件 dump.cs。够用于「解析 + 反汇编」。
@@ -24,7 +24,7 @@ public interface IMetadataSource
     bool TryGetDeclaredInstanceMethodCount(string assemblyQualifiedName, out int count);
 
     /// <summary>
-    /// 方法返回类型。补丁不存返回类型，只能按 (声明类型, 名字, 参数个数) 定位；
+    /// 外部方法返回类型。补丁的外部签名不存返回类型，按 (声明类型, 名字, 参数个数) 查询；
     /// 同名同参数个数的重载返回类型不一致时置 ambiguous。
     /// </summary>
     bool TryGetReturnType(string declaringTypeAqn, string methodName, int paramCount,

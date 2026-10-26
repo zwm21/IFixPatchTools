@@ -38,8 +38,6 @@ public sealed class PatchDocument
         if (map != null && !map.IsEmpty)
             foreach (var kv in map.Enumerate()) doc.OpCodeMap[kv.Value] = kv.Key;
 
-        // Keep shuffled value -> name for round-trip; serialize as name->value
-        // Enumerate() helpers defined in OpCodeMap partial
         foreach (var m in p.Methods)
         {
             var mi = new MethodIr { Id = m.Id };
@@ -63,6 +61,8 @@ public sealed class PatchDocument
 
     public PatchFile ToPatchFile(out OpCodeMap map)
     {
+        var errors = ValidateStructure();
+        if (errors.Count != 0) throw new InvalidDataException(string.Join(Environment.NewLine, errors));
         map = new OpCodeMap();
         if (OpCodeMap.Count > 0) map.LoadFromNameToValue(OpCodeMap);
         var p = new PatchFile
@@ -88,7 +88,7 @@ public sealed class PatchDocument
             {
                 foreach (var ir in mir.Code)
                 {
-                    int code = ir.Op.StartsWith("code#") && int.TryParse(ir.Op[5..], out var v) ? v : nameToCode.TryGetValue(ir.Op, out var c) ? c : 0;
+                    int code = ir.Op.StartsWith("code#") && int.TryParse(ir.Op[5..], out var v) ? v : nameToCode.TryGetValue(ir.Op, out var c) ? c : throw new InvalidDataException($"Unknown instruction {ir.Op}");
                     m.Code.Add(new Instr { Code = code, Operand = ir.Operand });
                 }
                 foreach (var eh in mir.Handlers) m.Handlers.Add(eh.ToModel());
@@ -108,42 +108,65 @@ public sealed class PatchDocument
     {
         WriteIndented = true,
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        RespectNullableAnnotations = true,
+        UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow,
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
     };
 
     public string ToJson() => JsonSerializer.Serialize(this, JsonOpts);
-    public static PatchDocument FromJson(string json) => JsonSerializer.Deserialize<PatchDocument>(json, JsonOpts)!;
+    public static PatchDocument FromJson(string json)
+    {
+        using var document = JsonDocument.Parse(json);
+        void Unique(JsonElement element)
+        {
+            if (element.ValueKind == JsonValueKind.Object)
+            {
+                var names = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var property in element.EnumerateObject())
+                {
+                    if (!names.Add(property.Name)) throw new InvalidDataException("Duplicate JSON property: " + property.Name);
+                    Unique(property.Value);
+                }
+            }
+            else if (element.ValueKind == JsonValueKind.Array)
+                foreach (var item in element.EnumerateArray())
+                {
+                    if (item.ValueKind == JsonValueKind.Null) throw new InvalidDataException("Null array elements are not valid patch IR.");
+                    Unique(item);
+                }
+        }
+        Unique(document.RootElement);
+        return JsonSerializer.Deserialize<PatchDocument>(json, JsonOpts) ?? throw new InvalidDataException("Expected a patch IR document.");
+    }
     public void SaveJson(string path) => File.WriteAllText(path, ToJson());
     public static PatchDocument LoadJson(string path) => FromJson(File.ReadAllText(path));
 
+    private List<string> ValidateStructure()
+    {
+        var errors = new List<string>();
+        if (Version != CurrentVersion) errors.Add($"version {Version} != {CurrentVersion}");
+        var ids = Methods.Select(method => method.Id).Order().ToArray();
+        if (!ids.SequenceEqual(Enumerable.Range(0, Methods.Count))) errors.Add("Method ids must be unique and dense from zero");
+        var map = new global::IFixPatch.Core.OpCodeMap();
+        map.LoadFromNameToValue(OpCodeMap);
+        var validation = map.Validate();
+        if (validation.Unknown.Count != 0 || validation.NameConflicts.Count != 0 || validation.ValueConflicts.Count != 0 || OpCodeMap.Values.Any(value => value < 0))
+            errors.Add("Invalid or ambiguous opcode map");
+        foreach (var method in Methods)
+            foreach (var instruction in method.Code)
+                if (!OpCodeMap.ContainsKey(instruction.Op) && !(instruction.Op.StartsWith("code#", StringComparison.Ordinal) && int.TryParse(instruction.Op[5..], out _)))
+                    errors.Add($"method#{method.Id}: unknown instruction {instruction.Op}");
+        return errors;
+    }
+
     public List<string> Validate()
     {
-        var errs = new List<string>();
-        if (Version != CurrentVersion) errs.Add($"version {Version} != {CurrentVersion}");
-        if (OpCodeMap.Count > 0)
-        {
-            var canon = new HashSet<string>(OpCodeMap.Keys);
-            // allow partial map but check duplicates already handled by dict
-            foreach (var kv in OpCodeMap) if (kv.Value < 0) errs.Add($"opcode {kv.Key} has negative value {kv.Value}");
-        }
-        for (int i = 0; i < ExternTypes.Count; i++) if (string.IsNullOrWhiteSpace(ExternTypes[i])) errs.Add($"externTypes[{i}] empty");
-        var maxMethodId = Methods.Count == 0 ? -1 : Methods.Max(m => m.Id);
-        if (Methods.Count != maxMethodId + 1 && Methods.Count > 0) errs.Add($"methods not dense: count {Methods.Count} maxId {maxMethodId}");
-        var methodIds = new HashSet<int>(Methods.Select(m => m.Id));
-        foreach (var fx in FixList) if (!methodIds.Contains(fx.MethodId) && fx.MethodId >= 0) errs.Add($"fixList methodId {fx.MethodId} not in methods");
-        foreach (var m in Methods)
-        {
-            foreach (var eh in m.Handlers)
-            {
-                if (eh.TryStart < 0 || eh.TryEnd < eh.TryStart || eh.HandlerStart < 0) errs.Add($"method#{m.Id} eh range invalid");
-                if (eh.HandlerEnd != -1 && eh.HandlerEnd < eh.HandlerStart) errs.Add($"method#{m.Id} eh HandlerEnd invalid");
-                if (eh.CatchTypeId != -1 && (eh.CatchTypeId < 0 || eh.CatchTypeId >= ExternTypes.Count)) errs.Add($"method#{m.Id} eh CatchTypeId out of range");
-            }
-            foreach (var ins in m.Code)
-                if (string.IsNullOrWhiteSpace(ins.Op)) errs.Add($"method#{m.Id} empty op");
-        }
-        return errs;
+        var errors = ValidateStructure();
+        if (errors.Count != 0) return errors;
+        var patch = ToPatchFile(out var map);
+        return PatchValidation.Validate(patch, map);
     }
+
 }
 
 public sealed class MethodIr

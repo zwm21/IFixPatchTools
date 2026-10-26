@@ -28,20 +28,20 @@ public sealed class PatchReader(Stream s, IMetadataSource? types = null)
         };
 
         // 3) 外部类型表：后续一切类型引用都是这张表的下标
-        int externTypeCount = _r.ReadInt32();
+        int externTypeCount = ReadCount("externTypeCount");
         for (int i = 0; i < externTypeCount; i++)
             p.ExternTypes.Add(_r.ReadString());
 
         // 4) 方法字节码表（按 methodId 稠密排列，不写 id）
-        int methodCount = _r.ReadInt32();
+        int methodCount = ReadCount("methodCount");
         for (int id = 0; id < methodCount; id++)
         {
             var m = new IFixMethod { Id = id };
-            int codeSize = _r.ReadInt32();
+            int codeSize = ReadCount("codeSize");
             for (int i = 0; i < codeSize; i++)
                 m.Code.Add(new Instr { Code = _r.ReadInt32(), Operand = _r.ReadInt32() });
 
-            int ehCount = _r.ReadInt32();
+            int ehCount = ReadCount("ehCount");
             for (int i = 0; i < ehCount; i++)
             {
                 m.Handlers.Add(new Eh
@@ -58,17 +58,17 @@ public sealed class PatchReader(Stream s, IMetadataSource? types = null)
         }
 
         // 5) 外部方法签名表
-        int externMethodCount = _r.ReadInt32();
+        int externMethodCount = ReadCount("externMethodCount");
         for (int i = 0; i < externMethodCount; i++)
             p.ExternMethods.Add(ReadMethodSig());
 
         // 6) 字符串常量池
-        int internCount = _r.ReadInt32();
+        int internCount = ReadCount("internCount");
         for (int i = 0; i < internCount; i++)
             p.InternStrings.Add(_r.ReadString());
 
         // 7) 字段表
-        int fieldCount = _r.ReadInt32();
+        int fieldCount = ReadCount("fieldCount");
         for (int i = 0; i < fieldCount; i++)
         {
             var f = new FieldEntry
@@ -86,7 +86,7 @@ public sealed class PatchReader(Stream s, IMetadataSource? types = null)
         }
 
         // 8) VM 内静态字段表
-        int staticFieldCount = _r.ReadInt32();
+        int staticFieldCount = ReadCount("staticFieldCount");
         for (int i = 0; i < staticFieldCount; i++)
             p.StaticFields.Add(new StaticFieldEntry
             {
@@ -95,11 +95,11 @@ public sealed class PatchReader(Stream s, IMetadataSource? types = null)
             });
 
         // 9) 匿名类/闭包表
-        int anonCount = _r.ReadInt32();
+        int anonCount = ReadCount("anonCount");
         for (int i = 0; i < anonCount; i++)
         {
             var a = new AnonStorey();
-            int fieldNum = _r.ReadInt32();
+            int fieldNum = ReadCount("fieldNum");
             for (int j = 0; j < fieldNum; j++)
                 a.FieldTypes.Add(_r.ReadInt32());
             a.CtorId = _r.ReadInt32();
@@ -107,8 +107,8 @@ public sealed class PatchReader(Stream s, IMetadataSource? types = null)
 
             // slot info：interfaceCount==0 时干净；否则每个接口后跟的 methodId 数量
             // 由该接口“已声明 public 实例方法数”决定（对应 readSlotInfo 的 GetMethods 遍历）。
-            // 该数字从 dump.cs 索引取；没有索引就无法推进，只能到此止步。
-            int interfaceCount = _r.ReadInt32();
+            // 该数字由元数据源提供；缺少对应信息时无法继续解析。
+            int interfaceCount = ReadCount("interfaceCount");
             if (interfaceCount != 0)
             {
                 a.HasInterfaces = true;
@@ -118,7 +118,7 @@ public sealed class PatchReader(Stream s, IMetadataSource? types = null)
                     p.FullyParsed = false;
                     p.ParseNote =
                         $"匿名类 #{i} 含 {interfaceCount} 个接口，slot 表长度依赖接口方法数，" +
-                        "需提供元数据源（--dummy-dll 或 --dump）才能解析。已解析到此处停止。";
+                        "需提供包含接口方法数的元数据源才能解析。已解析到此处停止。";
                     return p;
                 }
 
@@ -143,7 +143,7 @@ public sealed class PatchReader(Stream s, IMetadataSource? types = null)
                 }
             }
 
-            int vTableSize = _r.ReadInt32();
+            int vTableSize = ReadCount("vTableSize");
             for (int j = 0; j < vTableSize; j++)
                 a.VTable.Add(_r.ReadInt32());
             p.AnonStoreys.Add(a);
@@ -154,25 +154,33 @@ public sealed class PatchReader(Stream s, IMetadataSource? types = null)
         p.IdMapSuffix = _r.ReadString();
 
         // 12) 修复列表（interpretMethods）：签名 + methodId
-        int fixCount = _r.ReadInt32();
+        int fixCount = ReadCount("fixCount");
         for (int i = 0; i < fixCount; i++)
             p.FixList.Add(new FixEntry { Method = ReadMethodSig(), MethodId = _r.ReadInt32() });
 
         // 13) 新增类列表
-        int newClassCount = _r.ReadInt32();
+        int newClassCount = ReadCount("newClassCount");
         for (int i = 0; i < newClassCount; i++)
             p.NewClasses.Add(_r.ReadString());
 
         p.FullyParsed = true;
-        // 对齐硬校验：布局无 TOC，只要任一节长度算错就会错位；正好落在 EOF 是最强的正确性信号。
+        // 剩余字节可提示布局错位或附加数据；恰好到达 EOF 不证明补丁语义正确。
         var stream = _r.BaseStream;
         if (stream.CanSeek)
         {
             p.TrailingBytes = stream.Length - stream.Position;
             if (p.TrailingBytes != 0)
-                p.ParseNote = $"解析结束时剩余 {p.TrailingBytes} 字节未消费——某节长度推算有误（疑似接口槽计数不符）。";
+                p.ParseNote = $"解析结束时剩余 {p.TrailingBytes} 字节未消费；可能存在附加数据或布局计数不符。";
         }
         return p;
+    }
+
+    private int ReadCount(string label)
+    {
+        var count = _r.ReadInt32();
+        if (count < 0 || _r.BaseStream.CanSeek && count > _r.BaseStream.Length - _r.BaseStream.Position)
+            throw new InvalidDataException($"Invalid {label}: {count}");
+        return count;
     }
 
     private ExternMethodSig ReadMethodSig()
@@ -186,11 +194,11 @@ public sealed class PatchReader(Stream s, IMetadataSource? types = null)
 
         if (sig.IsGenericInstance)
         {
-            int genericArgCount = _r.ReadInt32();
+            int genericArgCount = ReadCount("genericArgCount");
             for (int i = 0; i < genericArgCount; i++)
                 sig.GenericArgTypeIds.Add(_r.ReadInt32());
 
-            int paramCount = _r.ReadInt32();
+            int paramCount = ReadCount("paramCount");
             for (int i = 0; i < paramCount; i++)
             {
                 var pr = new ExternMethodSig.Param { IsGeneric = _r.ReadBoolean() };
@@ -201,7 +209,7 @@ public sealed class PatchReader(Stream s, IMetadataSource? types = null)
         }
         else
         {
-            int paramCount = _r.ReadInt32();
+            int paramCount = ReadCount("paramCount");
             for (int i = 0; i < paramCount; i++)
                 sig.Params.Add(new ExternMethodSig.Param { TypeId = _r.ReadInt32() });
         }

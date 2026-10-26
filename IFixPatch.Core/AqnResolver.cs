@@ -10,9 +10,7 @@ namespace IFixPatch.Core;
 /// 字符串解析交给 .NET 官方的 <see cref="TypeName"/>（不需要加载程序集，正确处理泛型实参、
 /// 嵌套、byref、数组、指针）；引用构造交给 Cecil 的 MakeGenericInstanceType/MakeArrayType 等。
 /// 这里只负责把前者的结构映射到后者，不自己解析类型名语法。
-///
-/// 之前手写的字符串切分会丢掉 `[[...]]` 里的类型实参，导致反编译出现
-/// Dictionary&lt;TKey, TValue&gt; / !0 这类未实例化痕迹，这是替换它的原因。
+/// 泛型实参必须递归解析，以保留闭合类型身份。
 /// </summary>
 public sealed class AqnResolver(DummyDllSource src, ModuleDefinition module)
 {

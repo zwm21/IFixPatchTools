@@ -1,4 +1,5 @@
 using System.Text;
+using System.Globalization;
 
 namespace IFixPatch.Core;
 
@@ -81,7 +82,7 @@ public sealed class Disassembler(PatchFile p, OpCodeMap map)
             static string fmt(int v) => v == -1 ? "-1" : $"L{v:0000}";
             sb.Append($"    .eh {HandlerKind(eh)} try[{fmt(eh.TryStart)}..{fmt(eh.TryEnd)}) " +
                       $"handler[{fmt(eh.HandlerStart)}..{fmt(eh.HandlerEnd)})" +
-                      $"{(eh.HandlerType == 0 ? $" catch {(eh.CatchTypeId < 0 ? "object" : PrettyType(eh.CatchTypeId))}" : "")}\n");
+                      $"{(eh.HandlerType == 0 ? $" catch {(eh.CatchTypeId < 0 ? "object" : ($"type#{eh.CatchTypeId}"))}" : "")}\n");
         }
 
         foreach (var line in lines)
@@ -91,6 +92,7 @@ public sealed class Disassembler(PatchFile p, OpCodeMap map)
             if (line.Annot.Length > 0) sb.Append($"   ; {line.Annot}");
             sb.Append('\n');
         }
+        if (labels.Contains(m.Code.Count)) sb.Append($"  L{m.Code.Count:0000}:\n");
         return sb.ToString();
     }
 
@@ -116,7 +118,7 @@ public sealed class Disassembler(PatchFile p, OpCodeMap map)
             {
                 var slot = code[i + 1];
                 long bits = (uint)slot.Code | ((long)slot.Operand << 32);
-                line.Annot = mn == "Ldc_I8" ? $"= {bits}" : $"= {BitConverter.Int64BitsToDouble(bits)}";
+                line.Annot = $"bits64=0x{unchecked((ulong)bits):X16} value=" + (mn == "Ldc_I8" ? bits.ToString(CultureInfo.InvariantCulture) : BitConverter.Int64BitsToDouble(bits).ToString("R", CultureInfo.InvariantCulture));
                 line.Consumed = 2;
             }
         }
@@ -132,9 +134,12 @@ public sealed class Disassembler(PatchFile p, OpCodeMap map)
         else if (mn == "Switch")
         {
             int n = ins.Operand;
-            int slots = (n + 1) >> 1;
+            long borrowedSlots = ((long)n + 1) / 2;
+            if (n < 0 || borrowedSlots > code.Count - i - 1)
+                throw new InvalidDataException($"Invalid or truncated Switch at instruction {i}: {n} cases.");
+            int slots = (int)borrowedSlots;
             var targets = new List<int>();
-            for (int s = 0; s < slots && i + 1 + s < code.Count; s++)
+            for (int s = 0; s < slots; s++)
             {
                 var slot = code[i + 1 + s];
                 targets.Add(slot.Code);
@@ -144,10 +149,11 @@ public sealed class Disassembler(PatchFile p, OpCodeMap map)
             foreach (var t in abs) labels.Add(t);
             line.Annot = $"{n} cases → [{string.Join(", ", abs.Select(t => $"L{t:0000}"))}]";
             line.Consumed = 1 + slots;
+            if (n % 2 != 0) line.Annot += $" padding=0x{unchecked((uint)code[i + slots].Operand):X8}";
         }
         else if (CallFamily.Contains(mn))
         {
-            int id = ins.Operand & 0xFFFF, pc = ins.Operand >> 16;
+            int id = ins.Operand & 0xFFFF, pc = (int)((uint)ins.Operand >> 16);
             line.Annot = mn switch
             {
                 "CallExtern" or "Newobj" => $"argc={pc}, extern#{id} = {FormatExtern(id)}",
@@ -165,6 +171,10 @@ public sealed class Disassembler(PatchFile p, OpCodeMap map)
             {
                 var f = _p.Fields[ins.Operand];
                 line.Annot = $"{PrettyType(f.DeclaringTypeId)}.{f.Name}{(f.IsNew ? " (new)" : "")}";
+            }
+            else if (ins.Operand >= 0)
+            {
+                line.Annot = $"field#{ins.Operand}";
             }
             else
             {

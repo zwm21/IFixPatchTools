@@ -1,453 +1,237 @@
+using System.Globalization;
 using System.Text;
 using System.Text.RegularExpressions;
 
 namespace IFixPatch.Core.IR;
 
-public static partial class PatchTextAssembly
+/// <summary>Editable method bodies. Metadata and side tables remain owned by the base patch.</summary>
+public static class PatchTextAssembly
 {
-    public static string Disassemble(PatchFile p, OpCodeMap map)
+    public static string Disassemble(PatchFile patch, OpCodeMap map)
     {
-        var dis = new Disassembler(p, map);
-        var sb = new StringBuilder();
-        sb.AppendLine($".meta magic 0x{p.Magic:X16} bridge \"{Escape(p.InterfaceBridgeType)}\" wrapper \"{Escape(p.WrapperManagerType)}\" idmap \"{Escape(p.IdMapSuffix)}\"");
-        if (!map.IsEmpty)
+        var text = new StringBuilder();
+        text.AppendLine($".meta magic 0x{patch.Magic:X16} bridge \"{Escape(patch.InterfaceBridgeType)}\" wrapper \"{Escape(patch.WrapperManagerType)}\" idmap \"{Escape(patch.IdMapSuffix)}\"");
+        text.AppendLine($".opcode_map {map.Count}");
+        foreach (var item in map.Enumerate().OrderBy(item => item.Value)) text.AppendLine($"  {item.Value} = {item.Key}");
+        text.AppendLine($".extern_types {patch.ExternTypes.Count}");
+        for (var i = 0; i < patch.ExternTypes.Count; i++) text.AppendLine($"  #{i} \"{Escape(patch.ExternTypes[i])}\"");
+        text.AppendLine($".intern_strings {patch.InternStrings.Count}");
+        for (var i = 0; i < patch.InternStrings.Count; i++) text.AppendLine($"  #{i} \"{Escape(patch.InternStrings[i])}\"");
+        var disassembler = new Disassembler(patch, map);
+        foreach (var method in patch.Methods.Where(method => !method.IsEmpty))
         {
-            sb.AppendLine($".opcode_map {map.Count}");
-            foreach (var kv in map.Enumerate().OrderBy(k => k.Value))
-                sb.AppendLine($"  {kv.Value} = {kv.Key}");
+            text.AppendLine($".method #{method.Id} code {method.Code.Count} eh {method.Handlers.Count}");
+            text.Append(disassembler.Format(method));
         }
-        else
-        {
-            sb.AppendLine($".opcode_map 0");
-        }
-        sb.AppendLine($".extern_types {p.ExternTypes.Count}");
-        for (int i = 0; i < p.ExternTypes.Count; i++) sb.AppendLine($"  #{i} \"{Escape(p.ExternTypes[i])}\"");
-        sb.AppendLine($".intern_strings {p.InternStrings.Count}");
-        for (int i = 0; i < p.InternStrings.Count; i++) sb.AppendLine($"  #{i} \"{Disassembler.Escape(p.InternStrings[i])}\"");
-        // 文本仅替换方法体，其余侧表由 assemble 的 --base 提供。
-        foreach (var m in p.Methods.Where(m => !m.IsEmpty))
-        {
-            sb.AppendLine($".method #{m.Id} code {m.Code.Count} eh {m.Handlers.Count}");
-            sb.Append(dis.Format(m));
-        }
-        return sb.ToString();
+        return text.ToString();
     }
 
-    public static PatchFile Assemble(string text, PatchFile basePatch, OpCodeMap map)
+    public static PatchFile Assemble(string text, PatchFile basePatch, OpCodeMap map) => Assemble(text, basePatch, map, out _);
+
+    public static PatchFile Assemble(string text, PatchFile basePatch, OpCodeMap map, out OpCodeMap effectiveMap)
     {
-        var nameToCode = new Dictionary<string, int>(StringComparer.Ordinal);
-        if (!map.IsEmpty)
-            foreach (var kv in map.Enumerate()) nameToCode[kv.Value] = kv.Key;
-        var lines = text.Split('\n');
-        var parsedMap = new Dictionary<string, int>(StringComparer.Ordinal);
-        bool inOpcode = false;
-        foreach (var raw in lines)
+        if (!basePatch.FullyParsed || basePatch.TrailingBytes != 0) throw new InvalidDataException("The base patch must be fully parsed with no trailing bytes.");
+        var lines = text.Split('\n').Select(line => line.Trim()).Where(line => line.Length != 0 && !line.StartsWith(';')).ToArray();
+        foreach (var line in lines.Where(line => line.StartsWith('.')))
+            if (!new[] { ".meta ", ".opcode_map ", ".extern_types ", ".intern_strings ", ".method ", ".eh " }.Any(line.StartsWith))
+                throw new InvalidDataException("Unknown directive: " + line);
+        foreach (var prefix in new[] { ".meta ", ".opcode_map ", ".extern_types ", ".intern_strings " })
+            if (lines.Count(line => line.StartsWith(prefix, StringComparison.Ordinal)) > 1) throw new InvalidDataException("Duplicate section: " + prefix);
+        var pairs = map.Enumerate().ToDictionary(item => item.Value, item => item.Key, StringComparer.Ordinal);
+        var mapHeader = Array.FindIndex(lines, line => line.StartsWith(".opcode_map ", StringComparison.Ordinal));
+        if (mapHeader >= 0)
         {
-            var t = raw.Trim();
-            if (t.StartsWith(".opcode_map"))
+            pairs.Clear();
+            var count = Integer(lines[mapHeader][12..]);
+            if (count < 0 || count > lines.Length - mapHeader - 1) throw new InvalidDataException("Invalid opcode map size.");
+            for (var i = 0; i < count; i++)
             {
-                inOpcode = true;
-                continue;
-            }
-            if (inOpcode)
-            {
-                if (string.IsNullOrWhiteSpace(t) || t.StartsWith(".")) { inOpcode = false; if (t.StartsWith(".")) { /* fall through to handle this line as directive */ } else continue; }
-                else
-                {
-                    var m = MyRegex().Match(t);
-                    if (m.Success)
-                    {
-                        int val = int.Parse(m.Groups[1].Value);
-                        string name = m.Groups[2].Value;
-                        parsedMap[name] = val;
-                        continue;
-                    }
-                    m = Regex.Match(t, @"^\s*(\w+)\s*=\s*(\d+)\s*$");
-                    if (m.Success)
-                    {
-                        string name = m.Groups[1].Value;
-                        int val = int.Parse(m.Groups[2].Value);
-                        parsedMap[name] = val;
-                        continue;
-                    }
-                    inOpcode = false;
-                }
+                var match = Regex.Match(lines[mapHeader + i + 1], @"^(?:(\d+)\s*=\s*(\w+)|(\w+)\s*=\s*(\d+))$");
+                if (!match.Success) throw new InvalidDataException("Malformed opcode map entry.");
+                var name = match.Groups[2].Success ? match.Groups[2].Value : match.Groups[3].Value;
+                var code = Integer(match.Groups[1].Success ? match.Groups[1].Value : match.Groups[4].Value);
+                if (!pairs.TryAdd(name, code)) throw new InvalidDataException("Duplicate opcode name: " + name);
             }
         }
-        if (parsedMap.Count > 0) nameToCode = parsedMap;
-
-        var methodBlocks = new List<(int id, string block)>();
-        int idx = text.IndexOf(".method");
-        while (idx >= 0)
+        effectiveMap = OpCodeMap.FromPairs(pairs.Select(item => (item.Value, item.Key)));
+        if (!map.IsEmpty && effectiveMap.Enumerate().Any(item =>
+                map.TryName(item.Key, out var name) && name != item.Value ||
+                map.Enumerate().Any(original => original.Value == item.Value && original.Key != item.Key)))
+            throw new InvalidDataException("Text opcode map conflicts with the supplied target metadata.");
+        var validation = effectiveMap.Validate();
+        if (validation.Unknown.Count != 0 || validation.ValueConflicts.Count != 0 || validation.NameConflicts.Count != 0)
+            throw new InvalidDataException("Invalid opcode map.");
+        var expected = Disassemble(basePatch, effectiveMap).Split('\n').Select(line => line.Trim()).Where(line => line.Length != 0).ToArray();
+        // These printed sections are informational; reject edits rather than silently discarding them.
+        foreach (var prefix in new[] { ".meta ", ".extern_types ", ".intern_strings " })
         {
-            int next = text.IndexOf(".method", idx + 1);
-            string block = next >= 0 ? text[idx..next] : text[idx..];
-            var m = Regex.Match(block, @"\.method\s+#(\d+)");
-            if (m.Success && int.TryParse(m.Groups[1].Value, out var id))
-                methodBlocks.Add((id, block));
-            if (next < 0) break;
-            idx = next;
+            string[] Section(string[] source)
+            {
+                var start = Array.FindIndex(source, line => line.StartsWith(prefix, StringComparison.Ordinal));
+                if (start < 0) return [];
+                var end = start + 1;
+                while (end < source.Length && !source[end].StartsWith('.')) end++;
+                return source[start..end];
+            }
+            var section = Section(lines);
+            if (section.Length != 0 && !section.SequenceEqual(Section(expected)))
+                throw new InvalidDataException($"{prefix.Trim()} is read-only in IL text; edit IR to change side tables.");
         }
-
-        var result = ClonePatch(basePatch); // copy base, replace methods
-
-        foreach (var (id, block) in methodBlocks)
+        for (var at = 0; at < lines.Length && !lines[at].StartsWith(".method ", StringComparison.Ordinal); at++)
         {
-            var parsed = ParseMethod(block, nameToCode, basePatch);
-            while (result.Methods.Count <= id)
-                result.Methods.Add(new IFixMethod { Id = result.Methods.Count });
-            result.Methods[id].Code = parsed.Code;
-            result.Methods[id].Handlers = parsed.Handlers;
+            if (lines[at].StartsWith(".meta ", StringComparison.Ordinal)) continue;
+            var prefix = new[] { ".opcode_map ", ".extern_types ", ".intern_strings " }
+                .FirstOrDefault(prefix => lines[at].StartsWith(prefix, StringComparison.Ordinal));
+            if (prefix is null) throw new InvalidDataException("Unexpected text outside a method: " + lines[at]);
+            var count = Integer(lines[at][prefix.Length..]);
+            if (count < 0 || count > lines.Length - at - 1) throw new InvalidDataException("Invalid section size: " + prefix);
+            at += count;
         }
+        var document = PatchDocument.FromPatchFile(basePatch, map);
+        var result = document.ToPatchFile(out _);
+        var seen = new HashSet<int>();
+        for (var at = 0; at < lines.Length; at++)
+        {
+            if (!lines[at].StartsWith(".method", StringComparison.Ordinal)) continue;
+            var header = Regex.Match(lines[at], @"^\.method\s+#(\d+)(?:\s+code\s+\d+\s+eh\s+\d+)?$");
+            if (!header.Success) throw new InvalidDataException("Malformed method header: " + lines[at]);
+            var id = Integer(header.Groups[1].Value);
+            if (id >= result.Methods.Count || !seen.Add(id)) throw new InvalidDataException($"Unknown or duplicate method#{id}.");
+            var end = at + 1;
+            while (end < lines.Length && !lines[end].StartsWith(".method", StringComparison.Ordinal)) end++;
+            result.Methods[id] = ParseMethod(id, lines[(at + 1)..end], pairs, basePatch);
+            at = end - 1;
+        }
+        PatchValidation.RequireValid(result, effectiveMap);
         return result;
     }
 
-    private static PatchFile ClonePatch(PatchFile p)
+    private sealed record Logical(string Name, string Operand, string Comment);
+
+    private static IFixMethod ParseMethod(int id, string[] lines, Dictionary<string, int> codes, PatchFile patch)
     {
-        var n = new PatchFile
+        var logical = new List<Logical>();
+        var labels = new Dictionary<string, int>(StringComparer.Ordinal);
+        var handlers = new List<string>();
+        foreach (var line in lines)
         {
-            Magic = p.Magic,
-            InterfaceBridgeType = p.InterfaceBridgeType,
-            WrapperManagerType = p.WrapperManagerType,
-            IdMapSuffix = p.IdMapSuffix,
-            FullyParsed = true,
-        };
-        n.ExternTypes.AddRange(p.ExternTypes);
-        n.InternStrings.AddRange(p.InternStrings);
-        n.NewClasses.AddRange(p.NewClasses);
-        foreach (var em in p.ExternMethods) n.ExternMethods.Add(CloneSig(em));
-        foreach (var f in p.Fields) n.Fields.Add(new FieldEntry { IsNew = f.IsNew, DeclaringTypeId = f.DeclaringTypeId, Name = f.Name, FieldTypeId = f.FieldTypeId, CctorId = f.CctorId });
-        foreach (var sf in p.StaticFields) n.StaticFields.Add(new StaticFieldEntry { FieldTypeId = sf.FieldTypeId, CctorId = sf.CctorId });
-        foreach (var a in p.AnonStoreys)
-        {
-            var na = new AnonStorey { FieldTypes = [.. a.FieldTypes], CtorId = a.CtorId, CtorParamNum = a.CtorParamNum, HasInterfaces = a.HasInterfaces, VTable = [.. a.VTable] };
-            foreach (var it in a.Interfaces) na.Interfaces.Add(new AnonStorey.ItfSlots { TypeId = it.TypeId, MethodIds = [.. it.MethodIds] });
-            n.AnonStoreys.Add(na);
+            if (line.StartsWith(".eh ", StringComparison.Ordinal)) { handlers.Add(line); continue; }
+            var label = Regex.Match(line, @"^(L\d+):$");
+            if (label.Success)
+            {
+                if (!labels.TryAdd(label.Groups[1].Value, logical.Count)) throw new InvalidDataException("Duplicate label: " + line);
+                continue;
+            }
+            var match = Regex.Match(line, @"^(?:\d+\s+)?(code#-?\d+|\w+)(?:\s+([^\s;]+))?\s*(?:;\s*(.*))?$");
+            if (!match.Success) throw new InvalidDataException("Malformed instruction: " + line);
+            logical.Add(new Logical(match.Groups[1].Value, match.Groups[2].Value, match.Groups[3].Value));
         }
-        foreach (var fx in p.FixList) n.FixList.Add(new FixEntry { Method = CloneSig(fx.Method), MethodId = fx.MethodId });
-        foreach (var m in p.Methods)
+        var raw = new List<Instr>();
+        var positions = new List<int>();
+        foreach (var instruction in logical)
         {
-            var nm = new IFixMethod { Id = m.Id };
-            nm.Code.AddRange(m.Code.Select(ins => new Instr { Code = ins.Code, Operand = ins.Operand }));
-            nm.Handlers.AddRange(m.Handlers.Select(eh => new Eh { HandlerType = eh.HandlerType, CatchTypeId = eh.CatchTypeId, TryStart = eh.TryStart, TryEnd = eh.TryEnd, HandlerStart = eh.HandlerStart, HandlerEnd = eh.HandlerEnd }));
-            n.Methods.Add(nm);
-        }
-        return n;
-    }
-    private static ExternMethodSig CloneSig(ExternMethodSig s)
-    {
-        var n = new ExternMethodSig { IsGenericInstance = s.IsGenericInstance, DeclaringTypeId = s.DeclaringTypeId, Name = s.Name, GenericArgTypeIds = [.. s.GenericArgTypeIds] };
-        foreach (var pr in s.Params) n.Params.Add(new ExternMethodSig.Param { IsGeneric = pr.IsGeneric, GenericName = pr.GenericName, TypeId = pr.TypeId });
-        return n;
-    }
-
-    private sealed class ParsedMethod
-    {
-        public List<Instr> Code = [];
-        public List<Eh> Handlers = [];
-    }
-
-    private static ParsedMethod ParseMethod(string block, Dictionary<string, int> nameToCode, PatchFile basePatch)
-    {
-        var pm = new ParsedMethod();
-        var lines = block.Split('\n');
-        var ehList = new List<string>();
-        var instrLines = new List<string>();
-        foreach (var raw in lines)
-        {
-            var t = raw.Trim();
-            if (t.StartsWith(".eh"))
-                ehList.Add(t);
-            else if (Regex.IsMatch(t, @"^L\d+:\s*$"))
+            positions.Add(raw.Count);
+            if (!codes.TryGetValue(instruction.Name, out var code))
             {
-                instrLines.Add(raw); // keep for label handling
+                if (!instruction.Name.StartsWith("code#", StringComparison.Ordinal) || !int.TryParse(instruction.Name[5..], out code))
+                    throw new InvalidDataException("Unknown instruction: " + instruction.Name);
             }
-            else if (Regex.IsMatch(t, @"^\s*\d+\s+\w+"))
+            var operand = instruction.Operand.StartsWith('L') ? 0 : instruction.Operand.Length == 0 ? 0 : Integer(instruction.Operand);
+            raw.Add(new Instr { Code = code, Operand = operand });
+            if (instruction.Name is "Ldc_I8" or "Ldc_R8")
             {
-                instrLines.Add(raw);
-            }
-            else if (t.StartsWith(".method") || t.StartsWith(".meta") || t.StartsWith(".opcode") || t.StartsWith(".extern") || t.StartsWith(".intern") || string.IsNullOrWhiteSpace(t))
-            {
-                continue;
-            }
-            else if (t.Length == 0) continue;
-            else
-            {
-                if (Regex.IsMatch(t, @"^\w+"))
-                    instrLines.Add(raw);
-            }
-        }
-
-        var labelToIndex = new Dictionary<string, int>();
-
-        // 标签先指向逻辑指令，再映射到展开借用槽后的原始位置。
-        var pendingLabels = new List<string>();
-        var expandedInstructions = new List<(string mnemonic, string operandRaw, string annotation)>();
-
-        foreach (var rawLine in instrLines)
-        {
-            var trimmed = rawLine.Trim();
-            if (Regex.IsMatch(trimmed, @"^L(\d+):\s*$"))
-            {
-                var m = Regex.Match(trimmed, @"^L(\d+):");
-                string lab = $"L{m.Groups[1].Value.PadLeft(4, '0')}";
-                pendingLabels.Add(lab);
-                continue;
-            }
-
-            string operandToken = "";
-            string comment = "";
-            string line2 = rawLine;
-            int sc = line2.IndexOf(';');
-            if (sc >= 0) { comment = line2[(sc + 1)..]; line2 = line2[..sc]; }
-            var parts = line2.Trim().Split([' ', '\t'], StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length == 0) continue;
-            string mnemonic;
-            if (parts[0].Length == 4 && int.TryParse(parts[0], out _) && parts.Length >= 2)
-            {
-                mnemonic = parts[1];
-                if (parts.Length >= 3) operandToken = parts[2];
-            }
-            else
-            {
-                mnemonic = parts[0];
-                if (parts.Length >= 2) operandToken = parts[1];
-            }
-            foreach (var lab in pendingLabels)
-                labelToIndex[lab] = expandedInstructions.Count; // logical index, not raw yet
-            pendingLabels.Clear();
-
-            expandedInstructions.Add((mnemonic, operandToken, comment));
-        }
-        foreach (var lab in pendingLabels)
-            labelToIndex[lab] = expandedInstructions.Count;
-
-        // Ldc_I8/R8 和 Switch 会占用额外的 Instr 槽。
-        var rawCode = new List<Instr>();
-        var logicalToRaw = new Dictionary<int, int>();
-        for (int li = 0; li < expandedInstructions.Count; li++)
-        {
-            logicalToRaw[li] = rawCode.Count;
-            var (mn, opTok, comment) = expandedInstructions[li];
-            int codeVal;
-            if (mn.StartsWith("code#"))
-            {
-                int.TryParse(mn[5..], out codeVal);
-            }
-            else if (!nameToCode.TryGetValue(mn, out codeVal))
-            {
-                codeVal = 0;
-            }
-            int operand = 0;
-            if (mn == "Ldc_I8" || mn == "Ldc_R8")
-            {
-                long bits = 0;
-                var m = Regex.Match(comment, @"=\s*(-?\d+)");
-                if (mn == "Ldc_R8")
-                {
-                    var md = Regex.Match(comment, @"=\s*([\-0-9\.eE\+]+)");
-                    if (md.Success && double.TryParse(md.Groups[1].Value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var d))
-                        bits = BitConverter.DoubleToInt64Bits(d);
-                    else if (int.TryParse(opTok, out var v)) bits = v;
-                }
-                else // Ldc_I8
-                {
-                    if (m.Success && long.TryParse(m.Groups[1].Value, out var lv)) bits = lv;
-                    else if (int.TryParse(opTok, out var iv)) bits = iv;
-                }
-                rawCode.Add(new Instr { Code = codeVal, Operand = operand });
-                int low = (int)(bits & 0xFFFFFFFF);
-                int high = (int)(bits >> 32);
-                rawCode.Add(new Instr { Code = low, Operand = high });
-                continue;
-            }
-            else if (mn == "Switch")
-            {
-                if (!int.TryParse(opTok, out int n))
-                {
-                    var m = Regex.Match(comment, @"(\d+)\s*cases");
-                    if (m.Success) int.TryParse(m.Groups[1].Value, out n);
-                }
-                rawCode.Add(new Instr { Code = codeVal, Operand = n });
-                // 先为 Switch 的目标表预留槽位，最终偏移在标签解析后写入。
-                int slots = (n + 1) / 2;
-                for (int slot = 0; slot < slots; slot++)
-                    rawCode.Add(new Instr());
-                continue;
-            }
-            else if (IsBranch(mn))
-            {
-                bool isLabel = opTok.StartsWith("L");
-                if (isLabel)
-                {
-                    operand = 0;
-                }
-                else if (int.TryParse(opTok, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var iv))
-                {
-                    operand = iv;
-                }
-                else if (!string.IsNullOrEmpty(opTok) && opTok.StartsWith("0x"))
-                {
-                    operand = Convert.ToInt32(opTok, 16);
-                }
-                rawCode.Add(new Instr { Code = codeVal, Operand = operand });
-                continue;
-            }
-            else
-            {
-                if (!string.IsNullOrEmpty(opTok))
-                {
-                    if (opTok.StartsWith("L"))
-                    {
-                        operand = 0;
-                    }
-                    else if (int.TryParse(opTok, out var iv)) operand = iv;
-                    else if (opTok.StartsWith("0x") && int.TryParse(opTok[2..], System.Globalization.NumberStyles.HexNumber, null, out var hv)) operand = hv;
-                    else operand = 0;
-                }
+                var encoded = Regex.Match(instruction.Comment, @"bits64=0x([0-9a-fA-F]{16})\b");
+                long bits;
+                if (encoded.Success) bits = unchecked((long)ulong.Parse(encoded.Groups[1].Value, NumberStyles.HexNumber, CultureInfo.InvariantCulture));
                 else
                 {
-                    operand = 0;
+                    var value = Regex.Match(instruction.Comment, @"^=\s*(\S+)");
+                    if (!value.Success) throw new InvalidDataException(instruction.Name + " requires bits64 or a value annotation.");
+                    bits = instruction.Name == "Ldc_I8" ? long.Parse(value.Groups[1].Value, CultureInfo.InvariantCulture)
+                        : BitConverter.DoubleToInt64Bits(double.Parse(value.Groups[1].Value, CultureInfo.InvariantCulture));
                 }
-                rawCode.Add(new Instr { Code = codeVal, Operand = operand });
+                raw.Add(new Instr { Code = (int)bits, Operand = (int)(bits >> 32) });
+            }
+            else if (instruction.Name == "Switch")
+            {
+                if (operand < 0 || operand > 2_000_000) throw new InvalidDataException("Invalid Switch count.");
+                for (var slot = 0; slot < (operand + 1) / 2; slot++) raw.Add(new Instr());
             }
         }
-
-        // 所有槽位分配完成后，统一重算分支、Switch 和异常区域标签。
-        var labelToRaw = new Dictionary<string, int>();
-        foreach (var kv in labelToIndex)
-            if (logicalToRaw.TryGetValue(kv.Value, out var rawIdx))
-                labelToRaw[kv.Key] = rawIdx;
-            else if (kv.Value == expandedInstructions.Count)
-                labelToRaw[kv.Key] = rawCode.Count; // end
-
-        for (int li = 0; li < expandedInstructions.Count; li++)
+        positions.Add(raw.Count);
+        int Bound(string value, bool end = false)
         {
-            var (mn, opTok, comment) = expandedInstructions[li];
-            int curRaw = logicalToRaw[li];
-            if (mn == "Switch")
+            if (value.StartsWith('L'))
             {
-                int n = rawCode[curRaw].Operand;
-                var mt = Regex.Match(comment, @"(?:->|→)\s*\[(.*)\]");
-                var targets = new List<string>();
-                if (mt.Success)
+                if (!labels.TryGetValue(value, out var index)) throw new InvalidDataException("Undefined label: " + value);
+                return positions[index];
+            }
+            if (end && value == "-1") return -1;
+            return Integer(value);
+        }
+        for (var i = 0; i < logical.Count; i++)
+        {
+            var instruction = logical[i]; var position = positions[i];
+            if (Branches.Contains(instruction.Name) || instruction.Name == "Leave")
+            {
+                var annotated = Regex.Match(instruction.Comment, @"(?:->|→)\s*(L\d+)");
+                var target = instruction.Operand.StartsWith('L') ? instruction.Operand : annotated.Success ? annotated.Groups[1].Value : null;
+                if (target is not null)
                 {
-                    var inner = mt.Groups[1].Value;
-                    foreach (var tok in inner.Split(',')) { var t2 = tok.Trim(); if (t2.Length > 0) targets.Add(t2); }
-                }
-                while (targets.Count < n) targets.Add($"L{curRaw:0000}"); // fallback
-                int slots = (n + 1) / 2;
-                for (int s = 0; s < slots; s++)
-                {
-                    int idx0 = s * 2;
-                    int idx1 = idx0 + 1;
-                    int rel0 = 0, rel1 = 0;
-                    if (idx0 < targets.Count && labelToRaw.TryGetValue(targets[idx0], out var abs0))
-                        rel0 = abs0 - curRaw;
-                    if (idx1 < targets.Count && labelToRaw.TryGetValue(targets[idx1], out var abs1))
-                        rel1 = abs1 - curRaw;
-                    rawCode[curRaw + 1 + s] = new Instr { Code = rel0, Operand = rel1 };
+                    var absolute = Bound(target);
+                    raw[position] = new Instr { Code = raw[position].Code, Operand = instruction.Name == "Leave" ? absolute : absolute - position };
                 }
             }
-            else if (IsBranch(mn) || mn == "Leave")
+            else if (instruction.Name == "Switch")
             {
-                if (opTok.StartsWith("L") && labelToRaw.TryGetValue(opTok, out var abs))
+                var match = Regex.Match(instruction.Comment, @"(?:->|→)\s*\[([^\]]*)\]");
+                var targets = match.Success ? match.Groups[1].Value.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries) : [];
+                var count = raw[position].Operand;
+                if (targets.Length != count) throw new InvalidDataException("Switch target count does not match its operand.");
+                for (var n = 0; n < count; n++)
                 {
-                    int rel = mn == "Leave" ? abs : abs - curRaw;
-                    rawCode[curRaw] = new Instr { Code = rawCode[curRaw].Code, Operand = rel };
+                    var index = position + 1 + n / 2; var slot = raw[index];
+                    if (n % 2 == 0) slot.Code = Bound(targets[n]) - position; else slot.Operand = Bound(targets[n]) - position;
+                    raw[index] = slot;
                 }
+                var padding = Regex.Match(instruction.Comment, @"padding=0x([0-9a-fA-F]{8})\b");
+                if (count % 2 != 0 && padding.Success)
+                {
+                    var index = position + (count + 1) / 2; var slot = raw[index];
+                    slot.Operand = unchecked((int)uint.Parse(padding.Groups[1].Value, NumberStyles.HexNumber, CultureInfo.InvariantCulture)); raw[index] = slot;
+                }
+            }
+        }
+        var method = new IFixMethod { Id = id, Code = raw };
+        foreach (var line in handlers)
+        {
+            var match = Regex.Match(line, @"^\.eh\s+(catch|filter|finally|fault)\s+try\[([^.]*)\.\.([^)]*)\)\s+handler\[([^.]*)\.\.([^)]*)\)(?:\s+catch\s+(.+))?$");
+            if (!match.Success) throw new InvalidDataException("Malformed exception region: " + line);
+            var catchType = -1;
+            if (match.Groups[6].Success && match.Groups[6].Value != "object")
+            {
+                var type = match.Groups[6].Value;
+                if (type.StartsWith("type#", StringComparison.Ordinal)) catchType = Integer(type[5..]);
                 else
                 {
-                    var cm = Regex.Match(comment, @"(?:->|→)\s*L(\d+)");
-                    if (cm.Success)
-                    {
-                        string lab = $"L{int.Parse(cm.Groups[1].Value):0000}";
-                        if (labelToRaw.TryGetValue(lab, out var abs2))
-                        {
-                            int rel = mn == "Leave" ? abs2 : abs2 - curRaw;
-                            rawCode[curRaw] = new Instr { Code = rawCode[curRaw].Code, Operand = rel };
-                        }
-                        else if (int.TryParse(cm.Groups[1].Value, out var absNum))
-                        {
-                            if (absNum >= 0 && absNum < rawCode.Count) { /* fallback */ }
-                        }
-                    }
+                    var matches = patch.ExternTypes.Select((aqn, index) => (aqn, index)).Where(item => item.aqn == type || AqnName(item.aqn) == type).ToArray();
+                    if (matches.Length != 1) throw new InvalidDataException("Unknown or ambiguous catch type: " + type);
+                    catchType = matches[0].index;
                 }
             }
-            else if (mn == "Ldc_I8" || mn == "Ldc_R8")
+            method.Handlers.Add(new Eh
             {
-            }
+                HandlerType = match.Groups[1].Value switch { "catch" => 0, "filter" => 1, "finally" => 2, "fault" => 4, _ => throw new InvalidDataException() },
+                CatchTypeId = catchType, TryStart = Bound(match.Groups[2].Value), TryEnd = Bound(match.Groups[3].Value, true),
+                HandlerStart = Bound(match.Groups[4].Value), HandlerEnd = Bound(match.Groups[5].Value, true),
+            });
         }
-
-        pm.Code = rawCode;
-
-        foreach (var ehLine in ehList)
-        {
-            var m = Regex.Match(ehLine, @"\.eh\s+(\w+)\s+try\[(?:L(\d+)|-1)\.\.(?:L(\d+)|-1)\)\s+handler\[(?:L(\d+)|-1)\.\.(?:L(\d+)|-1)\)(?:\s+catch\s+(.+))?");
-            if (!m.Success)
-            {
-                m = Regex.Match(ehLine, @"\.eh\s+(\w+)\s+try\[([^\.]+)\.\.([^\]]+)\)\s+handler\[([^\.]+)\.\.([^\]]+)\)(?:\s+catch\s+(.+))?");
-                if (!m.Success) continue;
-            }
-            string kind = m.Groups[1].Value;
-            int tryS = ParseEhBound(m.Groups[2].Value, labelToRaw);
-            int tryE = ParseEhBound(m.Groups[3].Value, labelToRaw);
-            int handS = ParseEhBound(m.Groups[4].Value, labelToRaw);
-            int handE = ParseEhBound(m.Groups[5].Value, labelToRaw);
-            int handlerType = kind switch { "catch" => 0, "filter" => 1, "finally" => 2, "fault" => 4, _ => 0 };
-            int catchId = -1;
-            if (m.Groups.Count >= 7 && !string.IsNullOrWhiteSpace(m.Groups[6].Value))
-            {
-                var ct = m.Groups[6].Value.Trim();
-                if (ct == "object") catchId = -1;
-                else
-                {
-                    int found = -1;
-                    for (int ti = 0; ti < basePatch.ExternTypes.Count; ti++)
-                        if (PrettyMatch(basePatch.ExternTypes[ti], ct)) { found = ti; break; }
-                    if (found >= 0) catchId = found;
-                }
-            }
-            pm.Handlers.Add(new Eh { HandlerType = handlerType, CatchTypeId = catchId, TryStart = tryS, TryEnd = tryE, HandlerStart = handS, HandlerEnd = handE });
-        }
-
-        return pm;
+        return method;
     }
 
-    private static int ParseEhBound(string token, Dictionary<string, int> labelToRaw)
-    {
-        token = token.Trim();
-        if (token == "-1") return -1;
-        var mm = Regex.Match(token, @"L(\d+)");
-        if (mm.Success)
-        {
-            string lab = $"L{int.Parse(mm.Groups[1].Value):0000}";
-            if (labelToRaw.TryGetValue(lab, out var v)) return v;
-            return int.Parse(mm.Groups[1].Value);
-        }
-        if (int.TryParse(token, out var iv))
-        {
-            string lab = $"L{iv:0000}";
-            if (labelToRaw.TryGetValue(lab, out var v2)) return v2;
-            return iv;
-        }
-        return -1;
-    }
-    private static bool PrettyMatch(string aqn, string pretty)
-    {
-        string p = Pretty(aqn);
-        return p == pretty || aqn == pretty;
-    }
-    private static string Pretty(string aqn)
-    {
-        int depth = 0;
-        for (int i = 0; i < aqn.Length; i++) { char c = aqn[i]; if (c == '[') depth++; else if (c == ']') depth--; else if (c == ',' && depth == 0) return aqn[..i]; }
-        return aqn;
-    }
-
-    private static bool IsBranch(string mn) => mn == "Br" || mn == "Brfalse" || mn == "Brtrue" || mn == "Beq" || mn == "Bge" || mn == "Bgt" || mn == "Ble" || mn == "Blt" || mn == "Bne_Un" || mn == "Bge_Un" || mn == "Bgt_Un" || mn == "Ble_Un" || mn == "Blt_Un";
-
-    private static string Escape(string s) => s.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n").Replace("\r", "\\r");
-    [GeneratedRegex(@"^\s*(\d+)\s*=\s*(\w+)\s*$")]
-    private static partial Regex MyRegex();
+    private static int Integer(string value) => value.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
+        ? unchecked((int)uint.Parse(value[2..], NumberStyles.HexNumber, CultureInfo.InvariantCulture)) : int.Parse(value, CultureInfo.InvariantCulture);
+    private static string AqnName(string value) { var depth = 0; for (var i = 0; i < value.Length; i++) { if (value[i] == '[') depth++; if (value[i] == ']') depth--; if (value[i] == ',' && depth == 0) return value[..i]; } return value; }
+    private static string Escape(string value) => Disassembler.Escape(value);
+    private static readonly HashSet<string> Branches = ["Br", "Brtrue", "Brfalse", "Beq", "Bge", "Bgt", "Ble", "Blt", "Bne_Un", "Bge_Un", "Bgt_Un", "Ble_Un", "Blt_Un"];
 }

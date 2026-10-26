@@ -2,7 +2,7 @@ namespace IFixPatch.Core;
 
 /// <summary>
 /// 一条 IFix VM 指令。对应 IFix.Core.Instruction（[StructLayout(Sequential)] { int Code; int Operand; }）。
-/// Code 是被 ShuffleInstruction 打乱过的枚举整数值，语义需借助逐游戏恢复的 opcode 映射表。
+/// Code 是被 ShuffleInstruction 打乱过的枚举整数值，语义需借助目标运行时的 opcode 映射表。
 /// </summary>
 public struct Instr
 {
@@ -103,7 +103,7 @@ public sealed class PatchFile
     public List<FixEntry> FixList = [];
     public List<string> NewClasses = [];
 
-    /// <summary>是否完整解析到文件尾。缺少 dump.cs 索引时会在含接口的匿名类处停下。</summary>
+    /// <summary>是否完成所有布局区段的解析。缺少接口方法数元数据时会在匿名类接口表处停止。</summary>
     public bool FullyParsed;
 
     /// <summary>解析结束后未消费的字节数；结合 FullyParsed 检查布局，0 不保证内容语义正确。</summary>

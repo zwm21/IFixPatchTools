@@ -10,6 +10,16 @@ public sealed class PatchWriter(Stream s)
         new PatchWriter(fs).Write(p);
     }
 
+    public static void WriteValidatedFile(string path, PatchFile patch, OpCodeMap? map = null)
+    {
+        PatchValidation.RequireValid(patch, map);
+        var bytes = WriteToBytes(patch);
+        path = Path.GetFullPath(path);
+        var temporary = path + ".tmp." + Guid.NewGuid().ToString("N");
+        try { File.WriteAllBytes(temporary, bytes); File.Move(temporary, path, true); }
+        finally { if (File.Exists(temporary)) File.Delete(temporary); }
+    }
+
     public static byte[] WriteToBytes(PatchFile p)
     {
         using var ms = new MemoryStream();

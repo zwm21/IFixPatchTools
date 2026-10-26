@@ -38,10 +38,6 @@ public sealed partial class DumpCsIndex
                     @"(?<kind>class|struct|interface|enum)\s+(?<name>[A-Za-z_][\w`+.]*)\s*(?<gen><[^>]*>)?")]
     private static partial Regex TypeDeclLine();
 
-    // 方法行：以访问修饰符起头、含括号、以 ; 结尾。属性渲染成 `{ get; }`（无括号）故不会误中。
-    [GeneratedRegex(@"^(?:public|private|protected|internal)\b[^;{}]*\([^;{}]*\)\s*;\s*$")]
-    private static partial Regex MethodLine();
-
     // 方法行（含具体实现，dump.cs 渲染为 `... ) { }`），用于抽取签名。
     [GeneratedRegex(@"^(?:public|private|protected|internal)\b[^;{}]*\([^;{}]*\)\s*(?:;|\{\s*\})\s*$")]
     private static partial Regex AnyMethodLine();
@@ -102,15 +98,14 @@ public sealed partial class DumpCsIndex
             if (!inMethods) continue;
             if (t.StartsWith('|') || t.StartsWith("/*") || t.StartsWith("//")) continue; // GenericInstMethod 注释块
 
-            // 接口槽计数：只数已声明的 public 实例抽象方法（与 GetMethods 语义一致，已验证）
-            if (!t.Contains(" static ") && MethodLine().IsMatch(t)) count++;
-
             // 签名索引：包含具体方法（`) { }`），用于补齐返回类型
             if (AnyMethodLine().IsMatch(t))
             {
                 var sig = ParseSignature(t);
                 if (sig != null)
                 {
+                    // Match GetMethods(DeclaredOnly | Public | Instance), including concrete methods.
+                    if (t.StartsWith("public ", StringComparison.Ordinal) && !sig.IsStatic && sig.Name is not (".ctor" or ".cctor")) count++;
                     if (!idx._methods.TryGetValue(curKey, out var list))
                         idx._methods[curKey] = list = [];
                     list.Add(sig);
@@ -207,7 +202,7 @@ public sealed partial class DumpCsIndex
     }
 
     /// <summary>
-    /// 查方法的返回类型。补丁不存返回类型，只能靠 (声明类型, 名字, 参数个数) 定位；
+    /// 查外部方法的返回类型。按 (声明类型, 名字, 参数个数) 定位；
     /// 同名同参数个数的重载若返回类型一致仍可确定，否则视为不确定。
     /// </summary>
     public bool TryGetReturnType(string declaringTypeAqn, string methodName, int paramCount,

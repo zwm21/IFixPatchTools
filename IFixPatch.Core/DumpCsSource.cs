@@ -4,7 +4,7 @@ namespace IFixPatch.Core;
 /// 单文件 dump.cs 作为元数据源。够用于「解析 + 反汇编」：接口方法数只需要一个整数，
 /// 返回类型也能拿到渲染字符串。
 ///
-/// 但它的签名只有短名、无命名空间，且真实数据里数百个简名重复，无法可靠消歧，
+/// 方法签名中的类型短名可能重名，无法提供可靠的完整类型身份，
 /// 所以不支持类型化引用 —— IL 转译需要 DummyDllSource。
 /// </summary>
 public sealed class DumpCsSource : IMetadataSource
@@ -19,7 +19,7 @@ public sealed class DumpCsSource : IMetadataSource
     {
         _path = path;
         _index = DumpCsIndex.FromFile(path);
-        // dump.cs 同时是 opcode 映射的来源；提取不到不算致命（可用 --opcodes 显式给）
+        // dump.cs 同时是 opcode 映射的来源；提取不到不算致命（可用 --opcode-map 显式给）
         try { _opcodes = OpCodeMap.FromFile(path); } catch { _opcodes = null; }
     }
 
