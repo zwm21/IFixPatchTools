@@ -16,12 +16,18 @@ git -C vendor/InjectFix checkout --detach 5ba42eb8f63fe37134a3c78690f97d8425e135
 ```
 
 需要 .NET 10 SDK；构建会还原 `Microsoft.NETFramework.ReferenceAssemblies.net471`。
-补丁实现目前以 `net471` 为目标。工具在 `DOTNET_ROOT/sdk` 和 `/usr/share/dotnet/sdk` 查找 Roslyn，
-使用其他 SDK 安装位置时应设置 `DOTNET_ROOT`。
+补丁实现目前以 `net471` 为目标。工具优先在 `DOTNET_ROOT/sdk` 查找 Roslyn，
+再检查 `DOTNET_HOST_PATH` 所在目录和运行中 .NET 的安装目录；同一安装内按版本号排序，同版本优先稳定版。
+编译进程遵循 `DOTNET_HOST_PATH`，框架引用使用 `NUGET_PACKAGES` 指定的缓存，未指定时使用用户默认 NuGet 缓存。
 
-目标输入由使用者提供：已注入 IFix 的目标版本 `Assembly-CSharp.dll`、同版本 `IFix.Core.dll`
+目标输入由使用者提供：已注入 IFix 的目标程序集（例如 `Assembly-CSharp.dll`）、同版本 `IFix.Core.dll`
 及其依赖程序集。普通的未注入程序集缺少 IDMAP 信息，不能直接作为 replacement 目标。
 模板见 [samples/sourcebuilder](../samples/sourcebuilder/README.md)。
+
+目标程序集名字和完整身份从元数据读取；输入文件可改名，`assemblyPath` 指向实际文件即可。
+一次构建只替换一个目标程序集，其他程序集作为依赖引用。
+manifest 的 `assemblyName` 表示补丁实现程序集，不能与目标程序集同名，且必须为非空简单文件名，不能包含路径分隔符、控制字符或常见非法文件名字符。
+目标与补丁实现均要求单模块程序集；模块作用域类型引用会明确拒绝。
 
 使用其他 InjectFix 源码目录时，在 `adapter` 或自动构建适配器的 `generate` 命令中添加
 `--injectfix-root /path/to/InjectFix`。直接使用 MSBuild 时，可传 `-p:InjectFixRoot=...`。
@@ -90,16 +96,32 @@ private static int Normalize(int value) => value < 0 ? 0 : value;
 helper 可跨类型、跨文件；`sources` 支持 `*.cs`、`Util/*.cs`、`**/*.cs` 等通配。
 `**` 只能作为最后一个目录段，其余目录段必须为字面量；展开为空会报错。
 
+## 状态与类型移植
+
+引用类型、静态字段、闭包和 iterator 会按可达类型图移植。
+新类型限于非泛型引用类；目标已有接口/委托桥接必须覆盖所需签名。
+通过 `typeBindings` 将实现程序集扩展类型绑定到现有目标，可声明新增字段和属性。
+具体布局见 [状态模板](../samples/sourcebuilder/state/README.md)。
+
 ## 产物与校验
 
-`prepare` 输出 `prepared-profile.json`、`clean-shell/`、`compile-ref/`、适配源码、方法与字段 catalog。
-`build` 输出实现 DLL/PDB、`Assembly-CSharp.grafted.dll`、`process_cfg` 和 `build-report.json`。
+`prepare` 输出 `prepared-profile.json`、`injection-layout.json`、`clean-shell/<目标程序集名>.dll`、
+`compile-ref/<目标程序集名>.dll`、适配源码、方法与字段 catalog。
+`build` 输出实现 DLL/PDB、`<目标程序集名>.grafted.dll`、`process_cfg` 和 `build-report.json`。
 报告记录 binding、IDMAP slot、helper、源码 SHA-256、泛型元数据引用证据及规模诊断。
 `generate` 会检查产物与源码哈希，并拒绝含 `fail` 诊断的报告。
 
+准备报告记录目标身份及注入布局文件位置。布局文件记录 wrapper、bridge、manager、redirect 类型，
+以及各 IDMAP 分段的字段和原始 slot；后续阶段核对其 SHA-256。
+旧 prepared 产物缺少身份或布局信息时，需要重新执行 `prepare`。
+编译引用按程序集元数据身份归集；同名不同身份或依赖内容冲突时拒绝构建。
+框架引用和显式指定的目标编译引用、IFix.Core 优先于同身份的目录副本。
+
 `verify` 检查完整解析、零尾随字节、字节往返、非空 fix list 和非空方法体；
-提供参考补丁时还会核对 magic。含内部方法的补丁必须提供 `--build-report`，
-内部方法数必须与报告中的 helper 数一致。通过时 `errors` 为空。
+提供参考补丁时还会核对 magic。含内部方法的补丁必须提供 `--build-report`。普通静态 helper 按数量核对；
+类型图补丁使用 `generate` 输出的 `*.generation.json` 核对产物/构建报告哈希及实际方法清单。
+通过时 `errors` 为空；结构、索引和 fix list 同时接受校验。
+已知补丁和生成补丁的 bridge、manager 及 IDMAP 程序集后缀也会与准备布局交叉核对。
 
 `nativeSlot` 来源于目标元数据的 IDMAP，必要时应与同版本 Native 调用入口核对。
 离线校验不覆盖 AOT 代码可用性、目标业务行为或客户端补丁加载。

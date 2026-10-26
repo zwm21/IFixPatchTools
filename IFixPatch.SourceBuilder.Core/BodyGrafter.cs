@@ -3,7 +3,7 @@ using Mono.Cecil.Cil;
 
 namespace IFixPatch.SourceBuilder.Core;
 
-public sealed class BodyGrafter
+public sealed partial class BodyGrafter
 {
     /// <summary>本次 graft 搬运的 helper。Graft 之后才有值。</summary>
     public IReadOnlyList<GraftHelperReport> Helpers { get; private set; } = [];
@@ -19,6 +19,10 @@ public sealed class BodyGrafter
 
     /// <summary>当前正在处理的实现方法/指令，用于给报错补上源码位置。</summary>
     private readonly SourceLocator _locator = new();
+    public bool HasTypeGraph { get; private set; }
+    public List<string> NewTypes { get; private set; } = [];
+    public List<string> AddedFields { get; private set; } = [];
+    public List<string> AddedProperties { get; private set; } = [];
 
     public List<GraftBindingReport> Graft(
         PreparedProfile prepared,
@@ -40,10 +44,11 @@ public sealed class BodyGrafter
         // 符号缺失会自动降级，不影响 graft 结果。
         using var implementationAssembly = CecilModel.ReadAssembly(
             implementationAssemblyPath,
-            prepared.ReferenceDirectories.Append(Path.GetDirectoryName(implementationAssemblyPath)!),
+            prepared.ReferenceDirectories.Prepend(Path.GetDirectoryName(prepared.CompileReferenceAssemblyPath)!)
+                .Append(Path.GetDirectoryName(implementationAssemblyPath)!),
             readSymbols: true);
         var catalog = SourceBuilderJson.Load<AssemblyCatalog>(prepared.CatalogPath);
-        var idMap = catalog.IdMap.ToDictionary(entry => entry.Field, entry => entry.Slot, StringComparer.Ordinal);
+        var idMap = catalog.IdMap.ToDictionary(entry => entry.Field, StringComparer.Ordinal);
 
         var targetModule = targetAssembly.MainModule;
         var implementationModule = implementationAssembly.MainModule;
@@ -60,47 +65,81 @@ public sealed class BodyGrafter
         }
 
         var entrySet = entries.Select(entry => entry.Implementation).ToHashSet();
-        var helperOrder = DiscoverHelpers(
-            entries.Select(entry => entry.Implementation), entrySet, implementationModule, out var calls);
         var helperMethods = new List<MethodDefinition>();
         var helperReports = new List<GraftHelperReport>();
-        if (helperOrder.Count != 0)
+        List<MethodDefinition> helperOrder;
+        Dictionary<MethodDefinition, List<MethodDefinition>> calls;
+        ImplementationGraph? graph = null;
+        NewTypes = [];
+        AddedFields = [];
+        AddedProperties = [];
+        HasTypeGraph = NeedsGraph(entries.Select(entry => entry.Implementation), implementationModule) || manifest.TypeBindings.Count != 0;
+        if (HasTypeGraph)
         {
-            var host = CreateHelperHost(targetModule, manifest.AssemblyName);
-            var usedNames = new HashSet<string>(StringComparer.Ordinal);
-            foreach (var helper in helperOrder)
+            graph = new ImplementationGraph(this, mapper, prepared, manifest, implementationModule, targetModule, entries);
+            graph.Build();
+            helperOrder = graph.Methods.Keys.Where(method => !entrySet.Contains(method) && method.HasBody).ToList();
+            helperMethods.AddRange(helperOrder.Select(method => graph.Methods[method]));
+            calls = graph.Calls;
+            for (var index = 0; index < helperOrder.Count; index++)
             {
-                _locator.Enter(helper);
-                var name = UniqueHelperName(helper, usedNames);
-                var grafted = new MethodDefinition(
-                    name,
-                    MethodAttributes.Public | MethodAttributes.Static | MethodAttributes.HideBySig,
-                    mapper.MapType(helper.ReturnType));
-                foreach (var parameter in helper.Parameters)
-                {
-                    grafted.Parameters.Add(new ParameterDefinition(
-                        parameter.Name,
-                        parameter.Attributes,
-                        mapper.MapType(parameter.ParameterType)));
-                }
-                host.Methods.Add(grafted);
-                mapper.RegisterHelper(helper, grafted);
-                helperMethods.Add(grafted);
+                var source = helperOrder[index]; var target = helperMethods[index];
                 helperReports.Add(new GraftHelperReport
                 {
-                    Implementation = helper.FullName,
-                    Grafted = grafted.FullName,
-                    SourceInstructionCount = helper.Body.Instructions.Count,
+                    Implementation = source.FullName,
+                    Grafted = target.FullName,
+                    SourceInstructionCount = source.Body.Instructions.Count,
+                    ResultInstructionCount = target.Body.Instructions.Count,
+                    LocalCount = target.Body.Variables.Count,
+                    MaxStackSize = target.Body.MaxStackSize,
+                    ExceptionHandlerCount = target.Body.ExceptionHandlers.Count
                 });
             }
-
-            for (var i = 0; i < helperOrder.Count; i++)
+            NewTypes = graph.NewTypes.Select(type => type.FullName).ToList();
+            AddedFields = graph.NewFields.Select(field => field.FullName).ToList();
+            AddedProperties = graph.NewProperties.Select(property => property.FullName).ToList();
+        }
+        else
+        {
+            helperOrder = DiscoverHelpers(entries.Select(entry => entry.Implementation), entrySet, implementationModule, out calls);
+            if (helperOrder.Count != 0)
             {
-                CloneBody(mapper, helperOrder[i], helperMethods[i]);
-                helperReports[i].ResultInstructionCount = helperMethods[i].Body.Instructions.Count;
-                helperReports[i].LocalCount = helperMethods[i].Body.Variables.Count;
-                helperReports[i].MaxStackSize = helperMethods[i].Body.MaxStackSize;
-                helperReports[i].ExceptionHandlerCount = helperMethods[i].Body.ExceptionHandlers.Count;
+                var host = CreateHelperHost(targetModule, manifest.AssemblyName);
+                var usedNames = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var helper in helperOrder)
+                {
+                    _locator.Enter(helper);
+                    var name = UniqueHelperName(helper, usedNames);
+                    var grafted = new MethodDefinition(
+                        name,
+                        MethodAttributes.Public | MethodAttributes.Static | MethodAttributes.HideBySig,
+                        mapper.MapType(helper.ReturnType));
+                    foreach (var parameter in helper.Parameters)
+                    {
+                        grafted.Parameters.Add(new ParameterDefinition(
+                            parameter.Name,
+                            parameter.Attributes,
+                            mapper.MapType(parameter.ParameterType)));
+                    }
+                    host.Methods.Add(grafted);
+                    mapper.RegisterHelper(helper, grafted);
+                    helperMethods.Add(grafted);
+                    helperReports.Add(new GraftHelperReport
+                    {
+                        Implementation = helper.FullName,
+                        Grafted = grafted.FullName,
+                        SourceInstructionCount = helper.Body.Instructions.Count,
+                    });
+                }
+
+                for (var i = 0; i < helperOrder.Count; i++)
+                {
+                    CloneBody(mapper, helperOrder[i], helperMethods[i]);
+                    helperReports[i].ResultInstructionCount = helperMethods[i].Body.Instructions.Count;
+                    helperReports[i].LocalCount = helperMethods[i].Body.Variables.Count;
+                    helperReports[i].MaxStackSize = helperMethods[i].Body.MaxStackSize;
+                    helperReports[i].ExceptionHandlerCount = helperMethods[i].Body.ExceptionHandlers.Count;
+                }
             }
         }
 
@@ -111,7 +150,7 @@ public sealed class BodyGrafter
             CloneBody(mapper, implementation, target);
             var idTag = CecilModel.ReadIdTag(target) ?? 0;
             var idMapField = target.DeclaringType.FullName.Replace('.', '-').Replace('/', '-') + "-" + target.Name + idTag;
-            if (!idMap.TryGetValue(idMapField, out var nativeSlot))
+            if (!idMap.TryGetValue(idMapField, out var nativeMapping))
                 throw new InvalidDataException(
                     $"Unable to resolve native IFix IDMAP slot for {target.FullName}: expected field {idMapField}.");
             patchedMethods.Add(target);
@@ -121,7 +160,8 @@ public sealed class BodyGrafter
                 Implementation = implementation.FullName,
                 IdTag = idTag,
                 NativeIdMapField = idMapField,
-                NativeSlot = nativeSlot,
+                NativeIdMapType = nativeMapping.DeclaringType,
+                NativeSlot = nativeMapping.Slot,
                 SourceInstructionCount = implementation.Body.Instructions.Count,
                 ResultInstructionCount = target.Body.Instructions.Count,
                 LocalCount = target.Body.Variables.Count,
@@ -151,9 +191,19 @@ public sealed class BodyGrafter
             calls,
             manifest.Limits,
             diagnostics);
+        if (graph is not null)
+        {
+            Size.ChainBounded = false;
+            diagnostics.Add(new BuildDiagnostic
+            {
+                Severity = "warn",
+                Rule = "type-graph-callgraph",
+                Message = "Stack estimates cover direct calls. Virtual dispatch, delegate callbacks, initializers and iterator resumptions require separate runtime validation.",
+            });
+        }
         Diagnostics = diagnostics;
         targetAssembly.Write(outputAssemblyPath);
-        ProcessConfigWriter.Write(processConfigPath, patchedMethods, helperMethods);
+        ProcessConfigWriter.Write(processConfigPath, patchedMethods, helperMethods, graph?.NewFields, graph?.NewProperties, graph?.NewTypes);
         return reports;
     }
 
@@ -337,7 +387,7 @@ public sealed class BodyGrafter
         $"{(parameter.IsOut ? "out " : parameter.IsIn ? "in " : "")}{parameter.ParameterType.FullName}";
 
     private static bool SameType(TypeReference left, TypeReference right) =>
-        left.FullName == right.FullName;
+        ReferenceMapper.SameSignatureType(left, right);
 
     private void CloneBody(
         ReferenceMapper mapper,
@@ -398,25 +448,26 @@ public sealed class BodyGrafter
         ReferenceMapper mapper,
         IReadOnlyDictionary<VariableDefinition, VariableDefinition> variables,
         IReadOnlyDictionary<Instruction, Instruction> instructions) => operand switch
-    {
-        null => null,
-        Instruction instruction => instructions[instruction],
-        Instruction[] targets => targets.Select(i => instructions[i]).ToArray(),
-        VariableDefinition variable => variables[variable],
-        ParameterDefinition parameter => MapParameter(target, parameter),
-        TypeReference type => mapper.MapType(type),
-        MethodReference method => mapper.MapMethod(method),
-        FieldReference field => mapper.MapField(field),
-        CallSite => throw new NotSupportedException(_locator.Decorate("calli/CallSite operands are not supported.")),
-        string or sbyte or byte or short or ushort or int or uint or long or ulong or float or double => operand,
-        _ => throw new NotSupportedException(_locator.Decorate($"Unsupported IL operand {operand.GetType().FullName}: {operand}")),
-    };
+        {
+            null => null,
+            Instruction instruction => instructions[instruction],
+            Instruction[] targets => targets.Select(i => instructions[i]).ToArray(),
+            VariableDefinition variable => variables[variable],
+            ParameterDefinition parameter => MapParameter(target, parameter),
+            TypeReference type => mapper.MapType(type),
+            MethodReference method => mapper.MapMethod(method),
+            FieldReference field => mapper.MapField(field),
+            CallSite => throw new NotSupportedException(_locator.Decorate("calli/CallSite operands are not supported.")),
+            string or sbyte or byte or short or ushort or int or uint or long or ulong or float or double => operand,
+            _ => throw new NotSupportedException(_locator.Decorate($"Unsupported IL operand {operand.GetType().FullName}: {operand}")),
+        };
 
     private static ParameterDefinition MapParameter(MethodDefinition target, ParameterDefinition source)
     {
         var logicalIndex = source.Index;
         if (!target.HasThis)
             return target.Parameters[logicalIndex];
+        if (source.Method.HasThis) return logicalIndex < 0 ? target.Body.ThisParameter : target.Parameters[logicalIndex];
         if (logicalIndex == 0)
             return target.Body.ThisParameter;
         return target.Parameters[logicalIndex - 1];
@@ -482,6 +533,8 @@ public sealed class BodyGrafter
         private readonly string _targetAssemblyName = targetModule.Assembly.Name.Name;
         private readonly string _implementationAssemblyName = implementationModule.Assembly.Name.Name;
         private readonly Dictionary<MethodDefinition, MethodDefinition> _helpers = new();
+        public readonly Dictionary<TypeDefinition, TypeDefinition> OwnedTypes = new();
+        public readonly Dictionary<FieldDefinition, FieldDefinition> OwnedFields = new();
         private readonly Dictionary<string, GenericInstanceType> _genericInstances = new(StringComparer.Ordinal);
 
         /// <summary>本次 graft 里出现过的闭合泛型实例（已映射到目标程序集），按全名去重。</summary>
@@ -535,8 +588,8 @@ public sealed class BodyGrafter
             if (assemblyName == _targetAssemblyName)
                 return FindTargetType(type);
             if (assemblyName == _implementationAssemblyName)
-                throw new NotSupportedException(locator.Decorate(
-                    $"Implementation-owned type closure is not supported: {type.FullName}"));
+                return type.Resolve() is { } owned && OwnedTypes.TryGetValue(owned, out var grafted) ? grafted
+                    : throw new NotSupportedException(locator.Decorate($"Implementation-owned type was not discovered: {type.FullName}"));
             return targetModule.ImportReference(type);
         }
 
@@ -593,9 +646,9 @@ public sealed class BodyGrafter
             {
                 1 => matches[0],
                 0 => throw new InvalidDataException(locator.Decorate(
-                    $"Unable to rebind Assembly-CSharp method: {method.FullName}")),
+                    $"Unable to rebind target method: {method.FullName}")),
                 _ => throw new InvalidDataException(locator.Decorate(
-                    $"Ambiguous Assembly-CSharp method rebind: {method.FullName}")),
+                    $"Ambiguous target method rebind: {method.FullName}")),
             };
         }
 
@@ -622,8 +675,8 @@ public sealed class BodyGrafter
         {
             var assemblyName = AssemblyName(field.DeclaringType.Scope);
             if (assemblyName == _implementationAssemblyName)
-                throw new NotSupportedException(locator.Decorate(
-                    $"Implementation-owned fields are not supported: {field.FullName}"));
+                return field.Resolve() is { } owned && OwnedFields.TryGetValue(owned, out var grafted) ? grafted
+                    : throw new NotSupportedException(locator.Decorate($"Implementation-owned field was not discovered: {field.FullName}"));
             if (assemblyName != _targetAssemblyName)
                 return targetModule.ImportReference(field);
 
@@ -636,9 +689,9 @@ public sealed class BodyGrafter
             {
                 1 => matches[0],
                 0 => throw new InvalidDataException(locator.Decorate(
-                    $"Unable to rebind Assembly-CSharp field: {field.FullName}")),
+                    $"Unable to rebind target field: {field.FullName}")),
                 _ => throw new InvalidDataException(locator.Decorate(
-                    $"Ambiguous Assembly-CSharp field rebind: {field.FullName}")),
+                    $"Ambiguous target field rebind: {field.FullName}")),
             };
             if (declaringType is not GenericInstanceType instance)
                 return match;
@@ -663,7 +716,7 @@ public sealed class BodyGrafter
         /// 比较签名位置上的两个类型。泛型形参按「归属种类 + 序号」比而不是按名字：MemberRef 的
         /// 签名里写的是 !0 / !!0，Cecil 给它们的 Name 未必等于定义里的 T，按 FullName 比会全不匹配。
         /// </summary>
-        private static bool SameSignatureType(TypeReference left, TypeReference right)
+        public static bool SameSignatureType(TypeReference left, TypeReference right)
         {
             if (left is GenericParameter leftParameter)
                 return right is GenericParameter rightParameter
@@ -692,8 +745,17 @@ public sealed class BodyGrafter
                 return right is PointerType rightPointer
                     && SameSignatureType(leftPointer.ElementType, rightPointer.ElementType);
 
-            return left.FullName == right.FullName;
+            // Equal namespace/name pairs in different dependencies denote different CLR types.
+            return left.FullName == right.FullName && TypeAssemblyIdentity(left) == TypeAssemblyIdentity(right);
         }
+
+        private static string TypeAssemblyIdentity(TypeReference type) => type.Scope switch
+        {
+            AssemblyNameReference assembly => assembly.FullName,
+            ModuleDefinition module => module.Assembly.Name.FullName,
+            ModuleReference module => type.Module.Assembly.Name.FullName + "/" + module.Name,
+            _ => throw new NotSupportedException("Unsupported signature type scope: " + type.FullName),
+        };
 
         private static string? AssemblyName(IMetadataScope scope) => scope switch
         {

@@ -15,6 +15,10 @@ public sealed class SourceBuilderProfile
 
 public sealed class PreparedProfile
 {
+    public string TargetAssemblyName { get; set; } = "";
+    public string TargetAssemblyIdentity { get; set; } = "";
+    public string InjectionLayoutPath { get; set; } = "";
+    public string InjectionLayoutSha256 { get; set; } = "";
     public string Name { get; set; } = "";
     public string TargetFramework { get; set; } = "net471";
     public string SourceProfilePath { get; set; } = "";
@@ -45,13 +49,16 @@ public sealed class PatchManifest
     public List<string> Sources { get; set; } = [];
     public List<PatchBinding> Patches { get; set; } = [];
 
+    /// <summary>Implementation-owned extension type to existing target type. New members become VM additions.</summary>
+    public Dictionary<string, string> TypeBindings { get; set; } = new();
+
     /// <summary>规模阈值。省略时用默认值，见 <see cref="PatchLimits"/>。</summary>
     public PatchLimits Limits { get; set; } = new();
 }
 
 /// <summary>
-/// build 阶段的规模阈值。默认值按「已知可用规模之上」定，判据见 PatchSizeAnalyzer 的注释：
-/// 求值栈那两条对着 VM 的 10240 定长共用栈，helper 数与指令数是经验线。
+/// build 阶段的规模阈值。求值栈按固定上游的 10240 槽位共用栈计算；
+/// helper 数与指令数使用经验警告阈值。
 /// </summary>
 public sealed class PatchLimits
 {
@@ -76,6 +83,8 @@ public sealed class PatchBinding
 
 public sealed class PrepareReport
 {
+    public string TargetAssemblyIdentity { get; set; } = "";
+    public string InjectionLayoutPath { get; set; } = "";
     public string Profile { get; set; } = "";
     public int TypeCount { get; set; }
     public int MethodCount { get; set; }
@@ -101,6 +110,7 @@ public sealed class MethodCatalogEntry
 
 public sealed class IdMapCatalogEntry
 {
+    public string DeclaringType { get; set; } = "";
     public string Field { get; set; } = "";
     public int Slot { get; set; }
 }
@@ -115,9 +125,8 @@ public sealed class AssemblyCatalog
 /// <summary>
 /// 目标程序集的字段表。写补丁时用来查「这个类型有哪些字段、叫什么、什么类型、能不能直接读」。
 ///
-/// 单独成文件而不是并进 <see cref="AssemblyCatalog"/>：后者已经数十 MB，而 BodyGrafter 每次
-/// build 都要把它整份反序列化，只为拿 IdMap。字段表并进去等于给每次 build 加一笔无谓开销。
-/// 按类型分组而不是平铺，是为了不让声明类型名重复几十万遍。
+/// 与 <see cref="AssemblyCatalog"/> 分开保存，避免移植方法体时额外读取字段清单。
+/// 按类型分组以减少重复的声明类型名。
 /// </summary>
 public sealed class FieldCatalog
 {
@@ -160,6 +169,7 @@ public sealed class GraftBindingReport
     public string Implementation { get; set; } = "";
     public int IdTag { get; set; }
     public string NativeIdMapField { get; set; } = "";
+    public string NativeIdMapType { get; set; } = "";
     public int NativeSlot { get; set; }
     public int SourceInstructionCount { get; set; }
     public int ResultInstructionCount { get; set; }
@@ -176,9 +186,8 @@ public sealed class BuildReport
     public string ManifestSha256 { get; set; } = "";
 
     /// <summary>
-    /// 参与本次编译的补丁源文件（通配符已展开），按喂给 csc 的顺序记录。
-    /// <c>generate</c> 会重新核对哈希：manifest 本身没变、但源码改了却忘记重跑 <c>build</c> 时，
-    /// 其余哈希全都对得上，只有这一段能发现产物已经过期。
+    /// 参与编译的补丁源文件（通配符已展开），按传给编译器的顺序记录。
+    /// <c>generate</c> 重新核对源码哈希，拒绝使用源码修改前的构建产物。
     /// </summary>
     public List<SourceFileRecord> Sources { get; set; } = [];
     public string ImplementationAssembly { get; set; } = "";
@@ -188,13 +197,17 @@ public sealed class BuildReport
     public string ProcessConfig { get; set; } = "";
     public string ProcessConfigSha256 { get; set; } = "";
     public List<GraftBindingReport> Bindings { get; set; } = [];
+    public bool HasTypeGraph { get; set; }
+    public List<string> NewTypes { get; set; } = [];
+    public List<string> AddedFields { get; set; } = [];
+    public List<string> AddedProperties { get; set; } = [];
 
     /// <summary>本次 graft 搬运的补丁内部 helper。它们不占 fix list，也不需要 Native IDMAP slot。</summary>
     public List<GraftHelperReport> Helpers { get; set; } = [];
 
     /// <summary>
-    /// 本次 graft 引用到的闭合泛型实例。<c>proven</c> 为 false 的需要人对着 dump 核一遍：
-    /// 工具只能证明存在，证明不了不存在（见 GenericInstanceProbe）。
+    /// 移植引用的闭合泛型实例。<c>proven</c> 为 false 表示未在目标元数据中观察到，
+    /// 需要另行核对 AOT 可用性；未观察到不等于不存在。
     /// </summary>
     public List<GenericInstanceReport> GenericInstances { get; set; } = [];
 
@@ -219,7 +232,7 @@ public sealed class PatchSizeReport
     public double DeepestChainPercent { get; set; }
     public string? DeepestChain { get; set; }
 
-    /// <summary>false = 至少有一个入口经 helper 递归，其栈占用取决于运行期递归深度。</summary>
+    /// <summary>false 表示存在递归，或类型图中的虚派发、回调等未由直接调用链覆盖的路径。</summary>
     public bool ChainBounded { get; set; } = true;
 
     public int MaxMethodSlots { get; set; }
@@ -283,4 +296,13 @@ public static class SourceBuilderJson
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
         File.WriteAllText(path, JsonSerializer.Serialize(value, Options));
     }
+}
+
+/// <summary>Links an emitted patch to the immutable build inputs, including implicit compiler-generated methods.</summary>
+public sealed class GenerationReport
+{
+    public string PatchSha256 { get; set; } = "";
+    public string BuildReportSha256 { get; set; } = "";
+    public int Methods { get; set; }
+    public int InternalMethods { get; set; }
 }

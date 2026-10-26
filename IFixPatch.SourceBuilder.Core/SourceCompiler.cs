@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Reflection.PortableExecutable;
+using System.Reflection;
 
 namespace IFixPatch.SourceBuilder.Core;
 
@@ -20,7 +21,7 @@ public sealed class SourceCompiler
         var references = CollectReferences(prepared);
         var start = new ProcessStartInfo
         {
-            FileName = "dotnet",
+            FileName = Environment.GetEnvironmentVariable("DOTNET_HOST_PATH") is { Length: > 0 } host ? host : "dotnet",
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
@@ -57,19 +58,42 @@ public sealed class SourceCompiler
 
     private static List<string> CollectReferences(PreparedProfile prepared)
     {
-        var references = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var references = new Dictionary<string, (string Identity, string Path)>(StringComparer.OrdinalIgnoreCase);
+        void Add(string path, bool preferred)
+        {
+            path = Path.GetFullPath(path);
+            var identity = AssemblyName.GetAssemblyName(path);
+            var name = identity.Name ?? throw new InvalidDataException("Reference has no assembly name: " + path);
+            if (references.TryGetValue(name, out var existing))
+            {
+                if (existing.Identity != identity.FullName)
+                    throw new InvalidDataException($"Conflicting assembly identities for {name}: {existing.Path} ({existing.Identity}) and {path} ({identity.FullName}).");
+                // Prepared target and framework references intentionally replace their source metadata copies.
+                if (!preferred) return;
+                if (PathAndHash.Sha256(existing.Path) != PathAndHash.Sha256(path))
+                    throw new InvalidDataException($"Conflicting preferred references for {name}: {existing.Path} and {path}.");
+            }
+            references[name] = (identity.FullName, path);
+        }
+        foreach (var path in Directory.EnumerateFiles(FindFrameworkReferenceDirectory(prepared.TargetFramework), "*.dll", SearchOption.AllDirectories).Where(IsManagedAssembly).Order(StringComparer.Ordinal))
+            Add(path, true);
+        Add(prepared.CompileReferenceAssemblyPath, true);
+        Add(prepared.IFixCoreAssemblyPath, true);
+        var preferredNames = references.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase);
         foreach (var directory in prepared.ReferenceDirectories)
         {
-            foreach (var path in Directory.EnumerateFiles(directory, "*.dll").Where(IsManagedAssembly))
-                references[Path.GetFileNameWithoutExtension(path)] = Path.GetFullPath(path);
+            foreach (var path in Directory.EnumerateFiles(directory, "*.dll").Where(IsManagedAssembly).Order(StringComparer.Ordinal))
+            {
+                var identity = AssemblyName.GetAssemblyName(path);
+                if (references.TryGetValue(identity.Name!, out var existing) && !preferredNames.Contains(identity.Name!) &&
+                    existing.Identity == identity.FullName && PathAndHash.Sha256(existing.Path) != PathAndHash.Sha256(path))
+                    throw new InvalidDataException($"Conflicting reference contents for {identity.Name}: {existing.Path} and {path}.");
+                Add(path, false);
+            }
         }
-        foreach (var path in Directory.EnumerateFiles(FindFrameworkReferenceDirectory(prepared.TargetFramework), "*.dll", SearchOption.AllDirectories).Where(IsManagedAssembly))
-            references[Path.GetFileNameWithoutExtension(path)] = Path.GetFullPath(path);
-        references["Assembly-CSharp"] = prepared.CompileReferenceAssemblyPath;
-        references["IFix.Core"] = prepared.IFixCoreAssemblyPath;
         if (!references.ContainsKey("mscorlib"))
             throw new InvalidDataException("The reference set does not contain mscorlib.dll.");
-        return references.Values.Order(StringComparer.Ordinal).ToList();
+        return references.Values.Select(reference => reference.Path).Order(StringComparer.Ordinal).ToList();
     }
 
     private static bool IsManagedAssembly(string path)
@@ -96,14 +120,14 @@ public sealed class SourceCompiler
             "net471" => ("microsoft.netframework.referenceassemblies.net471", "v4.7.1"),
             _ => throw new NotSupportedException($"Unsupported compiler target framework: {targetFramework}"),
         };
-        var packageRoot = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".nuget", "packages", packageName);
+        var packages = Environment.GetEnvironmentVariable("NUGET_PACKAGES");
+        if (string.IsNullOrWhiteSpace(packages))
+            packages = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".nuget", "packages");
+        var packageRoot = Path.Combine(Path.GetFullPath(packages), packageName);
         if (!Directory.Exists(packageRoot))
             throw new DirectoryNotFoundException(
                 $"Reference assembly package {packageName} is not restored under {packageRoot}.");
-        var candidate = Directory.EnumerateDirectories(packageRoot)
-            .OrderByDescending(path => path, StringComparer.Ordinal)
+        var candidate = VersionDirectories(packageRoot)
             .Select(path => Path.Combine(path, "build", ".NETFramework", frameworkDirectory))
             .FirstOrDefault(Directory.Exists);
         return candidate ?? throw new DirectoryNotFoundException(
@@ -115,15 +139,26 @@ public sealed class SourceCompiler
         var roots = new[]
         {
             Environment.GetEnvironmentVariable("DOTNET_ROOT"),
-            "/usr/share/dotnet",
+            Path.GetDirectoryName(Environment.GetEnvironmentVariable("DOTNET_HOST_PATH")),
+            new DirectoryInfo(System.Runtime.InteropServices.RuntimeEnvironment.GetRuntimeDirectory()).Parent?.Parent?.Parent?.FullName,
         }.Where(p => !string.IsNullOrWhiteSpace(p) && Directory.Exists(p)).Distinct();
 
-        var candidates = roots.SelectMany(root => Directory.EnumerateDirectories(Path.Combine(root!, "sdk")))
-            .Select(path => Path.Combine(path, "Roslyn", "bincore", "csc.dll"))
-            .Where(File.Exists)
-            .OrderByDescending(path => path, StringComparer.Ordinal)
-            .ToList();
-        return candidates.FirstOrDefault()
-            ?? throw new FileNotFoundException("Unable to locate Roslyn csc.dll under DOTNET_ROOT/sdk.");
+        // Keep an explicit installation ahead of the running host's installation.
+        // Runtime-only roots have no sdk directory and must not prevent fallback.
+        foreach (var root in roots)
+        {
+            var sdk = Path.Combine(root!, "sdk");
+            if (!Directory.Exists(sdk)) continue;
+            var candidate = VersionDirectories(sdk)
+                .Select(path => Path.Combine(path, "Roslyn", "bincore", "csc.dll"))
+                .FirstOrDefault(File.Exists);
+            if (candidate is not null) return candidate;
+        }
+        throw new FileNotFoundException("Unable to locate Roslyn csc.dll in the configured or running .NET installation.");
     }
+
+    private static IEnumerable<string> VersionDirectories(string root) => Directory.EnumerateDirectories(root)
+        .OrderByDescending(path => Version.TryParse(Path.GetFileName(path).Split('-')[0], out var version) ? version : new Version(0, 0))
+        .ThenBy(path => Path.GetFileName(path).Contains('-'))
+        .ThenByDescending(path => path, StringComparer.Ordinal);
 }

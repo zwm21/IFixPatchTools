@@ -7,14 +7,16 @@ public sealed class BuildPipeline
         preparedProfilePath = Path.GetFullPath(preparedProfilePath);
         manifestPath = Path.GetFullPath(manifestPath);
         outputDirectory = Path.GetFullPath(outputDirectory);
-        Directory.CreateDirectory(outputDirectory);
-
         var prepared = SourceBuilderJson.Load<PreparedProfile>(preparedProfilePath);
         var manifest = PathAndHash.LoadResolvedManifest(manifestPath);
+        PathAndHash.RequireAssemblyFileName(manifest.AssemblyName, "Implementation assembly name");
         ValidatePrepared(prepared);
+        if (StringComparer.OrdinalIgnoreCase.Equals(manifest.AssemblyName, prepared.TargetAssemblyName))
+            throw new InvalidDataException("Implementation assembly name must differ from the target assembly name.");
 
+        Directory.CreateDirectory(outputDirectory);
         var implementationPath = Path.Combine(outputDirectory, manifest.AssemblyName + ".dll");
-        var graftedPath = Path.Combine(outputDirectory, "Assembly-CSharp.grafted.dll");
+        var graftedPath = Path.Combine(outputDirectory, prepared.TargetAssemblyName + ".grafted.dll");
         var processConfigPath = Path.Combine(outputDirectory, "process_cfg");
 
         new SourceCompiler().Compile(prepared, manifest, implementationPath);
@@ -40,6 +42,10 @@ public sealed class BuildPipeline
             ProcessConfig = processConfigPath,
             ProcessConfigSha256 = PathAndHash.Sha256(processConfigPath),
             Bindings = bindings,
+            HasTypeGraph = grafter.HasTypeGraph,
+            NewTypes = grafter.NewTypes,
+            AddedFields = grafter.AddedFields,
+            AddedProperties = grafter.AddedProperties,
             Helpers = [.. grafter.Helpers],
             GenericInstances = [.. grafter.GenericInstances],
             Size = grafter.Size,
@@ -51,6 +57,10 @@ public sealed class BuildPipeline
 
     public static void ValidatePrepared(PreparedProfile prepared)
     {
+        if (string.IsNullOrWhiteSpace(prepared.TargetAssemblyName) || string.IsNullOrWhiteSpace(prepared.TargetAssemblyIdentity))
+            throw new InvalidDataException("Prepared profile has no target assembly identity; run prepare again.");
+        if (string.IsNullOrWhiteSpace(prepared.InjectionLayoutPath) || string.IsNullOrWhiteSpace(prepared.InjectionLayoutSha256))
+            throw new InvalidDataException("Prepared profile has no injection layout; run prepare again.");
         var inputs = new[]
         {
             prepared.SourceAssemblyPath,
@@ -60,13 +70,25 @@ public sealed class BuildPipeline
             prepared.FieldCatalogPath,
             prepared.CleanAssemblyPath,
             prepared.CompileReferenceAssemblyPath,
+            prepared.InjectionLayoutPath,
         };
         foreach (var input in inputs)
             if (!File.Exists(input))
                 throw new FileNotFoundException("Prepared profile input no longer exists.", input);
 
         if (PathAndHash.Sha256(prepared.SourceAssemblyPath) != prepared.SourceAssemblySha256)
-            throw new InvalidDataException("Source Assembly-CSharp hash drifted after prepare.");
+            throw new InvalidDataException("Source target assembly hash drifted after prepare.");
+        foreach (var assembly in new[] { prepared.SourceAssemblyPath, prepared.CleanAssemblyPath, prepared.CompileReferenceAssemblyPath })
+        {
+            var identity = System.Reflection.AssemblyName.GetAssemblyName(assembly);
+            if (identity.Name != prepared.TargetAssemblyName || identity.FullName != prepared.TargetAssemblyIdentity)
+                throw new InvalidDataException("Prepared assembly identity mismatch: " + assembly);
+        }
+        if (PathAndHash.Sha256(prepared.InjectionLayoutPath) != prepared.InjectionLayoutSha256)
+            throw new InvalidDataException("Injection layout hash drifted after prepare.");
+        var layout = InjectionLayout.Load(prepared);
+        if (System.Reflection.AssemblyName.GetAssemblyName(prepared.IFixCoreAssemblyPath).FullName != layout.RuntimeAssemblyIdentity)
+            throw new InvalidDataException("Injection layout runtime identity differs from IFix.Core.");
         if (PathAndHash.Sha256(prepared.IFixCoreAssemblyPath) != prepared.IFixCoreAssemblySha256)
             throw new InvalidDataException("IFix.Core hash drifted after prepare.");
         if (PathAndHash.Sha256(prepared.AdapterCoreSourcePath) != prepared.AdapterCoreSourceSha256)

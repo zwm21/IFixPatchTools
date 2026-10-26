@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <IsTestProject>true</IsTestProject>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../IFixPatch.SourceBuilder.Core.csproj" />
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies.net471" Version="1.0.3" PrivateAssets="all" GeneratePathProperty="true" />
+    <AssemblyMetadata Include="FrameworkReferenceDirectory" Value="$(PkgMicrosoft_NETFramework_ReferenceAssemblies_net471)/build/.NETFramework/v4.7.1" />
+  </ItemGroup>
+</Project>

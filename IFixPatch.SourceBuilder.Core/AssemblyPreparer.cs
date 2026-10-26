@@ -1,19 +1,11 @@
 using Mono.Cecil;
+using Mono.Cecil.Cil;
+using IFixPatch.Core;
 
 namespace IFixPatch.SourceBuilder.Core;
 
 public sealed class AssemblyPreparer
 {
-    private static readonly HashSet<string> InjectedTypeNames = new(StringComparer.Ordinal)
-    {
-        "IFix.ILFixDynamicMethodWrapper",
-        "IFix.ILFixInterfaceBridge",
-        "IFix.WrappersManagerImpl",
-        "IFix.IDMAP0",
-        "IFix.IDMAP1",
-        "IFix.IDMAP2",
-    };
-
     public PreparedProfile Prepare(string profilePath, string outputDirectory)
     {
         profilePath = Path.GetFullPath(profilePath);
@@ -29,18 +21,24 @@ public sealed class AssemblyPreparer
         Directory.CreateDirectory(compileRefDirectory);
         Directory.CreateDirectory(adapterDirectory);
 
-        var cleanPath = Path.Combine(cleanDirectory, "Assembly-CSharp.dll");
-        var compileRefPath = Path.Combine(compileRefDirectory, "Assembly-CSharp.dll");
+        var identity = System.Reflection.AssemblyName.GetAssemblyName(profile.AssemblyPath);
+        var assemblyName = identity.Name ?? throw new InvalidDataException("Target assembly has no name.");
+        PathAndHash.RequireAssemblyFileName(assemblyName, "Target assembly name");
+        var cleanPath = Path.Combine(cleanDirectory, assemblyName + ".dll");
+        var compileRefPath = Path.Combine(compileRefDirectory, assemblyName + ".dll");
         var adapterCoreSourcePath = Path.Combine(adapterDirectory, "Instruction.g.cs");
         var catalogPath = Path.Combine(outputDirectory, "catalog.json");
         var fieldCatalogPath = Path.Combine(outputDirectory, "field-catalog.json");
-        var report = new PrepareReport { Profile = profile.Name };
+        var layoutPath = Path.Combine(outputDirectory, "injection-layout.json");
+        var report = new PrepareReport { Profile = profile.Name, TargetAssemblyIdentity = identity.FullName, InjectionLayoutPath = layoutPath };
 
         AssemblyCatalog catalog;
         FieldCatalog fieldCatalog;
+        InjectionLayout layout;
         using (var source = CecilModel.ReadAssembly(profile.AssemblyPath, profile.ReferenceDirectories))
         {
-            catalog = BuildCatalog(source);
+            layout = InjectionInspector.Discover(source, System.Reflection.AssemblyName.GetAssemblyName(profile.IFixCoreAssemblyPath).FullName);
+            catalog = BuildCatalog(source, layout);
             // 从原始程序集读取字段可见性；编译引用会放宽访问权限。
             fieldCatalog = BuildFieldCatalog(source);
             report.TypeCount = source.MainModule.AllTypes().Count();
@@ -51,7 +49,7 @@ public sealed class AssemblyPreparer
 
         using (var clean = CecilModel.ReadAssembly(profile.AssemblyPath, profile.ReferenceDirectories))
         {
-            Sanitize(clean, report);
+            Sanitize(clean, report, layout);
             clean.Write(cleanPath);
         }
 
@@ -72,9 +70,18 @@ public sealed class AssemblyPreparer
         if (knownPatchMagic is not null && report.AdapterMagic != knownPatchMagic)
             throw new InvalidDataException(
                 $"IFix.Core magic 0x{report.AdapterMagic:X16} does not match known patch magic 0x{knownPatchMagic:X16}.");
+        if (profile.KnownPatchPath is not null)
+        {
+            using var metadata = new DummyDllSource(profile.ReferenceDirectories.Prepend(Path.GetDirectoryName(profile.AssemblyPath)!)
+                .Append(Path.GetDirectoryName(profile.IFixCoreAssemblyPath)!), [profile.AssemblyPath, profile.IFixCoreAssemblyPath]);
+            layout.ValidatePatchIdentity(PatchReader.ReadFile(profile.KnownPatchPath, metadata));
+        }
 
         var prepared = new PreparedProfile
         {
+            TargetAssemblyName = assemblyName,
+            TargetAssemblyIdentity = identity.FullName,
+            InjectionLayoutPath = layoutPath,
             Name = profile.Name,
             TargetFramework = profile.TargetFramework,
             SourceProfilePath = profilePath,
@@ -97,6 +104,8 @@ public sealed class AssemblyPreparer
         };
 
         SourceBuilderJson.Save(Path.Combine(outputDirectory, "prepare-report.json"), report);
+        SourceBuilderJson.Save(layoutPath, layout);
+        prepared.InjectionLayoutSha256 = PathAndHash.Sha256(layoutPath);
         SourceBuilderJson.Save(catalogPath, catalog);
         prepared.CatalogSha256 = PathAndHash.Sha256(catalogPath);
         SourceBuilderJson.Save(fieldCatalogPath, fieldCatalog);
@@ -110,7 +119,7 @@ public sealed class AssemblyPreparer
         if (string.IsNullOrWhiteSpace(profile.Name))
             throw new InvalidDataException("Profile name is required.");
         if (!File.Exists(profile.AssemblyPath))
-            throw new FileNotFoundException("Assembly-CSharp input does not exist.", profile.AssemblyPath);
+            throw new FileNotFoundException("Target assembly input does not exist.", profile.AssemblyPath);
         if (!File.Exists(profile.IFixCoreAssemblyPath))
             throw new FileNotFoundException("IFix.Core input does not exist.", profile.IFixCoreAssemblyPath);
         if (profile.KnownPatchPath is not null && !File.Exists(profile.KnownPatchPath))
@@ -122,7 +131,7 @@ public sealed class AssemblyPreparer
                 throw new DirectoryNotFoundException($"Reference directory does not exist: {directory}");
     }
 
-    private static AssemblyCatalog BuildCatalog(AssemblyDefinition assembly)
+    private static AssemblyCatalog BuildCatalog(AssemblyDefinition assembly, InjectionLayout layout)
     {
         var catalog = new AssemblyCatalog { AssemblyName = assembly.Name.FullName };
         foreach (var method in assembly.MainModule.AllTypes().SelectMany(t => t.Methods))
@@ -132,20 +141,7 @@ public sealed class AssemblyPreparer
                 IdTag = CecilModel.ReadIdTag(method),
             });
 
-        foreach (var type in assembly.MainModule.Types.Where(t =>
-                     t.Namespace == "IFix" && t.Name.StartsWith("IDMAP", StringComparison.Ordinal)))
-        {
-            foreach (var field in type.Fields)
-            {
-                if (!field.HasConstant || field.Constant is null)
-                    continue;
-                catalog.IdMap.Add(new IdMapCatalogEntry
-                {
-                    Field = field.Name,
-                    Slot = Convert.ToInt32(field.Constant),
-                });
-            }
-        }
+        catalog.IdMap.AddRange(layout.IdMapSegments.SelectMany(segment => segment.Entries));
         return catalog;
     }
 
@@ -207,12 +203,12 @@ public sealed class AssemblyPreparer
             _ => "unknown",
         };
 
-    private static void Sanitize(AssemblyDefinition assembly, PrepareReport report)
+    private static void Sanitize(AssemblyDefinition assembly, PrepareReport report, InjectionLayout layout)
     {
         var module = assembly.MainModule;
-        var remove = module.Types.Where(t =>
-            InjectedTypeNames.Contains(t.FullName) ||
-            t.Namespace.StartsWith("IFix.RedirectTo", StringComparison.Ordinal)).ToList();
+        var injectedNames = layout.RemovedTypes.ToHashSet(StringComparer.Ordinal);
+        var proxyNames = layout.BaseProxyMethods.ToHashSet(StringComparer.Ordinal);
+        var remove = module.Types.Where(type => injectedNames.Contains(type.FullName)).ToList();
         foreach (var type in remove)
         {
             report.RemovedTypes.Add(type.FullName);
@@ -225,11 +221,18 @@ public sealed class AssemblyPreparer
             foreach (var field in type.Fields)
                 report.StrippedCompilerGeneratedFields += StripCompilerGenerated(field.CustomAttributes);
             foreach (var method in type.Methods)
+            {
                 report.StrippedCompilerGeneratedMethods += StripCompilerGenerated(method.CustomAttributes);
+                // The clean shell is metadata-only. Retained injected bodies may reference removed wrapper types.
+                if (method.HasBody)
+                {
+                    method.Body = new MethodBody(method);
+                    method.Body.Instructions.Add(Instruction.Create(OpCodes.Ldnull));
+                    method.Body.Instructions.Add(Instruction.Create(OpCodes.Throw));
+                }
+            }
 
-            var proxies = type.Methods.Where(m =>
-                m.Name.StartsWith("__iFixBaseProxy_", StringComparison.Ordinal) ||
-                m.Name.StartsWith("<>iFixBaseProxy_", StringComparison.Ordinal)).ToList();
+            var proxies = type.Methods.Where(method => proxyNames.Contains(method.FullName)).ToList();
             foreach (var proxy in proxies)
             {
                 type.Methods.Remove(proxy);
@@ -237,8 +240,8 @@ public sealed class AssemblyPreparer
             }
         }
 
-        if (module.Types.Any(t => t.Name == "ILFixDynamicMethodWrapper"))
-            throw new InvalidDataException("Sanitizer left ILFixDynamicMethodWrapper in the clean shell.");
+        if (module.AllTypes().Any(type => injectedNames.Contains(type.FullName)))
+            throw new InvalidDataException("Sanitizer left injected metadata in the clean shell.");
     }
 
     private static int StripCompilerGenerated(Mono.Collections.Generic.Collection<CustomAttribute> attributes)

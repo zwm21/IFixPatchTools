@@ -66,7 +66,7 @@ internal static class SourceBuilderProgram
         Console.WriteLine(
             $"evaluation stack: {report.Size.DeepestChainSlots}/{report.Size.EvaluationStackLimit} slots " +
             $"({report.Size.DeepestChainPercent}%) on the deepest bounded chain" +
-            (report.Size.ChainBounded ? "" : "; some chains recurse and have no static bound"));
+            (report.Size.ChainBounded ? "" : "; some call paths have no static bound"));
 
         var failed = report.Diagnostics.Count(diagnostic => diagnostic.Severity == "fail");
         if (failed == 0)
@@ -106,7 +106,17 @@ internal static class SourceBuilderProgram
             log = await RunInjectFixAsync(prepared, report, injectFix, temporaryOutput);
             if (!File.Exists(temporaryOutput))
                 throw new InvalidOperationException("InjectFix exited without producing a patch.");
+            using var metadata = CreateMetadata(prepared);
+            var patch = PatchReader.ReadFile(temporaryOutput, metadata);
+            PatchValidation.RequireValid(patch, metadata.TryGetOpCodeMap());
+            InjectionLayout.Load(prepared).ValidatePatchIdentity(patch);
+            ValidateBindings(patch, report, metadata, prepared.TargetAssemblyIdentity);
             File.Move(temporaryOutput, output, true);
+            SourceBuilderJson.Save(output + ".generation.json", new GenerationReport
+            {
+                PatchSha256 = PathAndHash.Sha256(output), BuildReportSha256 = PathAndHash.Sha256(buildReportPath),
+                Methods = patch.Methods.Count, InternalMethods = patch.Methods.Count - patch.FixList.Count,
+            });
         }
         finally
         {
@@ -143,15 +153,16 @@ internal static class SourceBuilderProgram
         var patchPath = Path.GetFullPath(args[1]);
         var output = TryReadOption(args[2..], "-o", "--output") ?? patchPath + ".verify.json";
         var buildReportPath = TryReadOption(args[2..], "--build-report");
-        var expectedInternalMethods = buildReportPath is null
-            ? (int?)null
-            : SourceBuilderJson.Load<BuildReport>(Path.GetFullPath(buildReportPath)).Helpers.Count;
-        using var metadata = new DummyDllSource(prepared.ReferenceDirectories[0]);
+        var buildReport = buildReportPath is null ? null : SourceBuilderJson.Load<BuildReport>(Path.GetFullPath(buildReportPath));
+        var expectedInternalMethods = buildReport is null || buildReport.HasTypeGraph ? (int?)null : buildReport.Helpers.Count;
+        using var metadata = CreateMetadata(prepared);
         var patch = PatchReader.ReadFile(patchPath, metadata);
         var roundTrip = PatchWriter.WriteToBytes(patch);
         var source = File.ReadAllBytes(patchPath);
 
-        var errors = new List<string>();
+        var errors = PatchValidation.Validate(patch, metadata.TryGetOpCodeMap());
+        try { InjectionLayout.Load(prepared).ValidatePatchIdentity(patch); }
+        catch (Exception error) when (error is InvalidDataException or ArgumentException) { errors.Add(error.Message); }
         if (!patch.FullyParsed) errors.Add("Patch did not fully parse: " + patch.ParseNote);
         if (patch.TrailingBytes != 0) errors.Add($"Patch has {patch.TrailingBytes} trailing bytes.");
         if (!source.AsSpan().SequenceEqual(roundTrip)) errors.Add("Parse/serialize round-trip is not byte-identical.");
@@ -171,11 +182,30 @@ internal static class SourceBuilderProgram
                     $"Patch contains {internalMethods} internal methods but the build report grafted {expected} helpers; " +
                     "the difference is most likely a dummy member mistranslated into the VM.");
         }
+        else if (buildReport is { HasTypeGraph: true })
+        {
+            var generationPath = patchPath + ".generation.json";
+            if (!File.Exists(generationPath)) errors.Add("Type-graph patches require the generation report produced by generate.");
+            else
+            {
+                var generation = SourceBuilderJson.Load<GenerationReport>(generationPath);
+                if (generation.PatchSha256 != PathAndHash.Sha256(patchPath) || generation.BuildReportSha256 != PathAndHash.Sha256(buildReportPath!))
+                    errors.Add("Generation report does not match the patch or build report.");
+                if (generation.Methods != patch.Methods.Count || generation.InternalMethods != internalMethods)
+                    errors.Add("Generated method inventory does not match the patch.");
+            }
+        }
         else if (internalMethods != 0)
         {
             errors.Add(
                 $"Patch contains {internalMethods} internal methods; " +
                 "pass --build-report BUILD_REPORT.json so they can be reconciled against the grafted helpers.");
+        }
+
+        if (buildReport is not null && buildReport.Bindings.Count != 0)
+        {
+            try { ValidateBindings(patch, buildReport, metadata, prepared.TargetAssemblyIdentity); }
+            catch (InvalidDataException error) { errors.Add(error.Message); }
         }
 
         var result = new
@@ -201,6 +231,32 @@ internal static class SourceBuilderProgram
             ? $"verified: {Path.GetFullPath(output)}"
             : $"verification failed: {Path.GetFullPath(output)}");
         return errors.Count == 0 ? 0 : 2;
+    }
+
+    private static DummyDllSource CreateMetadata(PreparedProfile prepared) => new(
+        prepared.ReferenceDirectories.Prepend(Path.GetDirectoryName(prepared.SourceAssemblyPath)!)
+            .Append(Path.GetDirectoryName(prepared.IFixCoreAssemblyPath)!),
+        new[] { prepared.SourceAssemblyPath, prepared.IFixCoreAssemblyPath }.Distinct(StringComparer.Ordinal));
+
+    private static void ValidateBindings(PatchFile patch, BuildReport report, DummyDllSource metadata, string targetIdentity)
+    {
+        var actual = new List<string>();
+        foreach (var fix in patch.FixList)
+        {
+            var declaring = patch.ExternTypes[fix.Method.DeclaringTypeId];
+            var type = metadata.FindType(declaring) ?? throw new InvalidDataException("Missing fix declaring type: " + declaring);
+            if (type.Module.Assembly.Name.FullName != targetIdentity)
+                throw new InvalidDataException("Fix declaring type belongs to another assembly: " + declaring);
+            var matches = type.Methods.Where(method => method.Name == fix.Method.Name && method.Parameters.Count == fix.Method.Params.Count &&
+                method.Parameters.Zip(fix.Method.Params).All(pair => !pair.Second.IsGeneric &&
+                    pair.First.ParameterType.FullName.Replace('/', '+') == DummyDllSource.SplitAqn(patch.ExternTypes[pair.Second.TypeId]).TypeName.Replace('/', '+'))).ToArray();
+            if (matches.Length != 1) throw new InvalidDataException("Unknown or ambiguous generated fix binding: " + fix.Method.Name);
+            actual.Add(matches[0].FullName);
+        }
+        if (!actual.Order(StringComparer.Ordinal).SequenceEqual(report.Bindings.Select(binding => binding.Target).Order(StringComparer.Ordinal)))
+            throw new InvalidDataException("Generated fix list differs from the build bindings.");
+        if (report.HasTypeGraph && !patch.NewClasses.Select(name => name.Split(',')[0]).Order(StringComparer.Ordinal).SequenceEqual(report.NewTypes.Order(StringComparer.Ordinal)))
+            throw new InvalidDataException("Generated class inventory differs from the build type graph.");
     }
 
     private static async Task<string> RunInjectFixAsync(

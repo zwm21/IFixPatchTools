@@ -34,21 +34,37 @@ internal static class CecilModel
     }
 
     /// <summary>
-    /// <paramref name="readSymbols"/> 只对自己编出来的实现程序集开。目标程序集是 Il2CppInspector
-    /// 的 dummy dll，没有符号，强读会直接抛。即使开了也做降级：符号缺失或不匹配时按无符号读，
-    /// 代价只是报错里少一个源码位置，不该让整个 build 失败。
+    /// <paramref name="readSymbols"/> 用于补丁实现程序集的源码定位。
+    /// 符号缺失或不匹配时按无符号读取；目标元数据壳不要求携带符号。
     /// </summary>
     public static AssemblyDefinition ReadAssembly(
         string path, IEnumerable<string> directories, bool readSymbols = false)
     {
         var search = directories.Append(Path.GetDirectoryName(Path.GetFullPath(path))!).ToList();
-        AssemblyDefinition Read(bool symbols) => AssemblyDefinition.ReadAssembly(path, new ReaderParameters
+        AssemblyDefinition Read(bool symbols)
         {
-            AssemblyResolver = CreateResolver(search),
-            InMemory = true,
-            ReadSymbols = symbols,
-            ReadingMode = ReadingMode.Immediate,
-        });
+            var assembly = AssemblyDefinition.ReadAssembly(path, new ReaderParameters
+            {
+                AssemblyResolver = CreateResolver(search),
+                InMemory = true,
+                ReadSymbols = symbols,
+                ReadingMode = ReadingMode.Immediate,
+            });
+            try
+            {
+                // Preparation and grafting rebuild the main module only. Reject module-scoped
+                // types before writing an artifact that would silently omit part of an assembly.
+                var moduleTypes = assembly.MainModule.GetTypeReferences().Where(type => type.Scope is ModuleReference).Select(type => type.FullName).ToArray();
+                if (assembly.Modules.Count != 1 || moduleTypes.Length != 0)
+                    throw new NotSupportedException("Multi-module assemblies and module-scoped type references are not supported: " + path + ". " + string.Join(", ", moduleTypes));
+                return assembly;
+            }
+            catch
+            {
+                assembly.Dispose();
+                throw;
+            }
+        }
 
         if (!readSymbols || !File.Exists(Path.ChangeExtension(Path.GetFullPath(path), ".pdb")))
             return Read(false);

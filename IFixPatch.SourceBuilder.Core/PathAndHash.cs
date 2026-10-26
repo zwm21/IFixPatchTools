@@ -4,6 +4,14 @@ namespace IFixPatch.SourceBuilder.Core;
 
 public static class PathAndHash
 {
+    internal static void RequireAssemblyFileName(string? name, string label)
+    {
+        // Both path syntaxes are rejected so a manifest stays a simple name across platforms.
+        if (string.IsNullOrWhiteSpace(name) || name is "." or ".." ||
+            name.Any(character => char.IsControl(character) || "<>:\"/\\|?*".Contains(character)))
+            throw new InvalidDataException(label + " cannot be used as a file name: " + name);
+    }
+
     public static string ResolveFromFile(string ownerFile, string path)
     {
         if (string.IsNullOrWhiteSpace(path))

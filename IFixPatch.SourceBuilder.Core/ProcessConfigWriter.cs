@@ -23,14 +23,30 @@ public static class ProcessConfigWriter
     public static void Write(
         string path,
         IReadOnlyCollection<MethodDefinition> patchedMethods,
-        IReadOnlyCollection<MethodDefinition> newMethods)
+        IReadOnlyCollection<MethodDefinition> newMethods,
+        IReadOnlyCollection<FieldDefinition>? newFields = null,
+        IReadOnlyCollection<PropertyDefinition>? newProperties = null,
+        IReadOnlyCollection<TypeDefinition>? newClasses = null)
     {
         using var writer = new BinaryWriter(File.Create(path));
         WriteMethods(writer, patchedMethods);
         WriteMethods(writer, newMethods);
-        WriteEmptySection(writer); // new fields
-        WriteEmptySection(writer); // new properties
-        WriteEmptySection(writer); // new classes
+        var fields = (newFields ?? []).GroupBy(field => field.DeclaringType.FullName).ToArray();
+        writer.Write(fields.Length);
+        foreach (var group in fields)
+        {
+            writer.Write(group.Key); writer.Write(group.Count());
+            foreach (var field in group) { writer.Write(field.Name); writer.Write(field.FieldType.FullName); }
+        }
+        var properties = (newProperties ?? []).GroupBy(property => property.DeclaringType.FullName).ToArray();
+        writer.Write(properties.Length);
+        foreach (var group in properties)
+        {
+            writer.Write(group.Key); writer.Write(group.Count());
+            foreach (var property in group) { writer.Write(property.Name); writer.Write(property.PropertyType.FullName); }
+        }
+        writer.Write(newClasses?.Count ?? 0);
+        foreach (var type in newClasses ?? []) writer.Write(type.FullName);
     }
 
     private static void WriteMethods(BinaryWriter writer, IReadOnlyCollection<MethodDefinition> methods)
@@ -58,5 +74,4 @@ public static class ProcessConfigWriter
         }
     }
 
-    private static void WriteEmptySection(BinaryWriter writer) => writer.Write(0);
 }

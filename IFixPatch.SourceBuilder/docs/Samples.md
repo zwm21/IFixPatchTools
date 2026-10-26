@@ -10,5 +10,4 @@
 示例路径均相对仓库根目录。SourceBuilder 模板使用自定义 `Example.Calculator` 契约，
 用于展示签名和文件布局；实际目标应从 `catalog.json` 中选择。
 
-可执行的合成输入回归见 [tests/IFixPatchTools.Smoke](../../tests/IFixPatchTools.Smoke/IFixPatchTools.Smoke.csproj)。
-示例和自动回归仅验证离线工具行为，不宣称目标客户端已验证。
+示例用于检查离线工具行为；目标客户端是否可用，需要单独验证。

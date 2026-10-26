@@ -1,0 +1,12 @@
+{
+  "name": "calculator-state",
+  "assemblyName": "CalculatorStatePatch",
+  "sources": ["PatchImpl.cs"],
+  "typeBindings": { "ExamplePatch.CalculatorState": "Example.Calculator" },
+  "patches": [
+    {
+      "target": "System.Int32 Example.Calculator::Add(System.Int32)",
+      "implementation": "System.Int32 ExamplePatch.StatefulPatch::Add(Example.Calculator,System.Int32)"
+    }
+  ]
+}
