@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../IFixPatch.Decompiler.csproj" />
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies.net471" Version="1.0.3" PrivateAssets="all" GeneratePathProperty="true" />
+    <Content Include="$(PkgMicrosoft_NETFramework_ReferenceAssemblies_net471)/build/.NETFramework/v4.7.1/mscorlib.dll"
+             Link="ReferenceAssemblies/mscorlib.dll" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

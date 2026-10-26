@@ -153,37 +153,40 @@ static string Preview(List<string> xs) => xs.Count <= 12 ? string.Join(", ", xs)
 
 static int RunInfo(FileInfo patchFile, DirectoryInfo? dummyDll, FileInfo? dump, FileInfo? opcodeMapFile, bool json, FileInfo? output)
 {
-    TextWriter outWriter = output != null ? new StreamWriter(output.FullName, false, new System.Text.UTF8Encoding(false)) : Console.Out;
+    StreamWriter? fileWriter = null;
+    TextWriter outWriter = Console.Out;
     TextWriter err = Console.Error;
     try
     {
         if (!patchFile.Exists) { err.WriteLine($"error: 找不到补丁文件: {patchFile.FullName}"); return 2; }
 
         var types = CreateMetadataSource(dummyDll, dump, err);
+        using var metadataLifetime = types as IDisposable;
         if (dummyDll != null && types == null) return 2;
         if (dump != null && types == null) return 2;
-
-        TextWriter metaWriter = json ? err : outWriter;
-        if (types != null)
-        {
-            metaWriter.WriteLine($"元数据源: {types.Describe()}{(types.SupportsTypedReferences ? "  [可转译]" : "  [仅解析/反汇编]")}");
-            if (types is DummyDllSource dd && dd.Warnings.Count > 0)
-                foreach (var w in dd.Warnings) metaWriter.WriteLine($"  ⚠ {w}");
-            metaWriter.WriteLine();
-        }
-
         var map = ResolveOpcodeMap(opcodeMapFile, types, err, out bool ok);
         if (!ok) return 2;
-        if (!json) PrintOpCodeValidation(map, outWriter); else PrintOpCodeValidation(map, err);
 
         PatchFile p;
         try { p = PatchReader.ReadFile(patchFile.FullName, types); }
         catch (EndOfStreamException) { err.WriteLine("error: 读到文件尾之外——可能不是裸补丁或匿名类接口槽长度不符"); return 1; }
         catch (Exception e) { err.WriteLine($"error: 解析失败: {e.Message}"); return 1; }
 
+        if (output != null)
+        {
+            fileWriter = new StreamWriter(output.FullName, false, new System.Text.UTF8Encoding(false));
+            outWriter = fileWriter;
+        }
+        TextWriter metaWriter = json ? err : outWriter;
+        if (types != null)
+        {
+            metaWriter.WriteLine($"元数据源: {types.Describe()}{(types.SupportsTypedReferences ? "  [可转译]" : "  [仅解析/反汇编]")}");
+            metaWriter.WriteLine();
+        }
+        PrintOpCodeValidation(map, metaWriter);
         if (json)
         {
-            var payload = BuildInfoJson(p, map, types);
+            var payload = BuildInfoJson(p, map);
             var jsonText = JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping });
             outWriter.WriteLine(jsonText);
         }
@@ -191,11 +194,18 @@ static int RunInfo(FileInfo patchFile, DirectoryInfo? dummyDll, FileInfo? dump, 
         {
             PrintSummary(p, map, types, outWriter);
         }
+        PrintMetadataWarnings(types, metaWriter);
+        outWriter.Flush();
         return 0;
+    }
+    catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+    {
+        err.WriteLine($"error: 写出失败: {error.Message}");
+        return 1;
     }
     finally
     {
-        if (output != null) outWriter.Dispose();
+        fileWriter?.Dispose();
     }
 }
 
@@ -204,6 +214,7 @@ static int RunDisasm(FileInfo patchFile, DirectoryInfo? dummyDll, FileInfo? dump
     TextWriter err = Console.Error;
     if (!patchFile.Exists) { err.WriteLine($"error: 找不到补丁文件: {patchFile.FullName}"); return 2; }
     var types = CreateMetadataSource(dummyDll, dump, err);
+    using var metadataLifetime = types as IDisposable;
     if (dummyDll != null && types == null) return 2;
     if (dump != null && types == null) return 2;
     var map = ResolveOpcodeMap(opcodeMapFile, types, err, out bool ok);
@@ -239,13 +250,12 @@ static int RunDecompile(FileInfo patchFile, DirectoryInfo dummyDll, FileInfo? op
     if (!patchFile.Exists) { err.WriteLine($"error: 找不到补丁文件: {patchFile.FullName}"); return 2; }
     if (!dummyDll.Exists) { err.WriteLine($"error: DummyDll 目录不存在: {dummyDll.FullName}"); return 2; }
 
-    IMetadataSource? types;
+    DummyDllSource types;
     try { types = new DummyDllSource(dummyDll.FullName); }
     catch (Exception e) { err.WriteLine($"error: 建立元数据源失败: {e.Message}"); return 2; }
 
+    using var metadataLifetime = types;
     Console.WriteLine($"元数据源: {types.Describe()}  [可转译]");
-    if (types is DummyDllSource dd && dd.Warnings.Count > 0)
-        foreach (var w in dd.Warnings) Console.WriteLine($"  ⚠ {w}");
 
     var map = ResolveOpcodeMap(opcodeMapFile, types, err, out bool ok);
     if (!ok) return 2;
@@ -257,11 +267,19 @@ static int RunDecompile(FileInfo patchFile, DirectoryInfo dummyDll, FileInfo? op
     catch (EndOfStreamException) { err.WriteLine("error: 读到文件尾之外——可能不是裸补丁或匿名类接口槽长度不符"); return 1; }
     catch (Exception e) { err.WriteLine($"error: 解析失败: {e.Message}"); return 1; }
 
+    var errors = PatchValidation.Validate(p, map);
+    if (errors.Count != 0) { foreach (var error in errors) err.WriteLine("error: " + error); return 2; }
     PrintSummary(p, map, types, Console.Out);
 
-    if (types is not DummyDllSource dds) { err.WriteLine("error: --decompile 需要 --dummy-dll"); return 2; }
-
-    var rep = PatchDecompiler.Run(p, map, dds);
+    DecompileReport rep;
+    try { rep = PatchDecompiler.Run(p, map, types); }
+    catch (Exception error) when (error is InvalidDataException or NotSupportedException or InvalidOperationException)
+    {
+        PrintMetadataWarnings(types, err);
+        err.WriteLine("error: 无法恢复补丁语义: " + error.Message);
+        return 2;
+    }
+    PrintMetadataWarnings(types, Console.Out);
     Console.WriteLine("\n═══ IL 转译 + 反编译 ═══");
     Console.WriteLine($"  修复列表方法: {rep.FixTranspiled}/{rep.FixMethods} 转译成功");
     Console.WriteLine($"  内部方法    : {rep.InternalTranspiled}/{rep.InternalMethods} 转译成功");
@@ -292,14 +310,22 @@ static int RunDecompile(FileInfo patchFile, DirectoryInfo dummyDll, FileInfo? op
     }
     if (rep.CSharp.Length > 0)
     {
-        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(output.FullName)) ?? ".");
-        File.WriteAllText(output.FullName, rep.CSharp);
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(output.FullName)) ?? ".");
+            File.WriteAllText(output.FullName, rep.CSharp);
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            err.WriteLine($"error: 写出失败: {error.Message}");
+            return 1;
+        }
         Console.WriteLine($"  C# 已写出: {output.FullName} ({rep.CSharp.Length} 字符)");
     }
-    return 0;
+    return rep.CSharp.Length == 0 || rep.Problems.Count != 0 || rep.Balance.Count != 0 ? 2 : 0;
 }
 
-static object BuildInfoJson(PatchFile p, OpCodeMap map, IMetadataSource? types)
+static object BuildInfoJson(PatchFile p, OpCodeMap map)
 {
     var dis = new Disassembler(p, map);
     int nonEmpty = p.Methods.Count(m => !m.IsEmpty);
@@ -450,6 +476,7 @@ static int RunExport(FileInfo patchFile, FileInfo output, FileInfo? opcodeMapFil
     TextWriter err = Console.Error;
     if (!patchFile.Exists) { err.WriteLine($"error: 找不到补丁文件: {patchFile.FullName}"); return 2; }
     var types = CreateMetadataSource(dummyDll, dump, err);
+    using var metadataLifetime = types as IDisposable;
     if (dummyDll != null && types == null) return 2;
     if (dump != null && types == null) return 2;
     var map = ResolveOpcodeMap(opcodeMapFile, types, err, out bool ok);
@@ -458,25 +485,25 @@ static int RunExport(FileInfo patchFile, FileInfo output, FileInfo? opcodeMapFil
     try { p = PatchReader.ReadFile(patchFile.FullName, types); }
     catch (EndOfStreamException) { err.WriteLine("error: 读到文件尾之外——可能不是裸补丁或匿名类接口槽长度不符"); return 1; }
     catch (Exception e) { err.WriteLine($"error: 解析失败: {e.Message}"); return 1; }
+    var validation = PatchValidation.Validate(p, map);
+    if (validation.Count != 0) { foreach (var error in validation) err.WriteLine("error: " + error); return 2; }
     var doc = PatchDocument.FromPatchFile(p, map);
     var errs = doc.Validate();
-    if (errs.Count>0) foreach(var e in errs) err.WriteLine($"warn: {e}");
+    if (errs.Count > 0) { foreach (var error in errs) err.WriteLine("error: " + error); return 2; }
     try { doc.SaveJson(output.FullName); }
     catch(Exception e){ err.WriteLine($"error: 写出失败: {e.Message}"); return 1; }
     Console.WriteLine($"exported {p.Methods.Count} methods, {p.ExternTypes.Count} extern types -> {output.FullName}");
-    if (!p.FullyParsed) err.WriteLine($"warn: 未完整解析到尾: {p.ParseNote}");
-    else if (p.TrailingBytes!=0) err.WriteLine($"warn: 剩余 {p.TrailingBytes} 字节未消费——布局错位");
     return 0;
+}
+
+static void PrintMetadataWarnings(IMetadataSource? source, TextWriter writer)
+{
+    if (source is DummyDllSource dummy)
+        foreach (var warning in dummy.Warnings) writer.WriteLine($"  ⚠ {warning}");
 }
 
 static string Short(string aqn)
 {
     int comma = aqn.IndexOf(',');
     return comma > 0 ? aqn[..comma] : aqn;
-}
-
-partial class Program
-{
-    [System.Text.RegularExpressions.GeneratedRegex(@"[#\[]\d+\]?")]
-    private static partial System.Text.RegularExpressions.Regex MyRegex();
 }

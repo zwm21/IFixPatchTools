@@ -13,6 +13,7 @@ public sealed class DecompileReport
     public int MethodsWithProblems;
     public List<string> Problems = [];
     public string CSharp = "";
+    public byte[] AssemblyImage = [];
     public List<BalanceIssue> Balance = [];
     public int TypedParams, TotalParams, TypedRets, TotalRets;
     public int Storeys, BoundStoreyMethods, TypedStoreyFields, TotalStoreyFields, UntouchedStoreyFields;
@@ -24,33 +25,24 @@ public sealed class DecompileReport
 /// <summary>
 /// 把补丁转成一个合成程序集再交给 ICSharpCode.Decompiler。
 ///
-/// 分两遍：先声明所有方法（修复列表的 47 个 + 其余内部方法的桩）、VM 静态字段、
+/// 分两遍：先声明所有方法（修复列表的方法及其余内部方法的桩）、VM 静态字段、
 /// 匿名类分配器；再填充方法体。这样 Call 指向后面才声明的内部方法也能前向引用。
 /// </summary>
 public static class PatchDecompiler
 {
+    /// <summary>从已通过 PatchValidation 的补丁构建分析报告；元数据源由调用方释放。</summary>
     public static DecompileReport Run(PatchFile p, OpCodeMap map, DummyDllSource src)
     {
         var report = new DecompileReport();
 
         // 合成程序集必须共用 DummyDll 的解析器，否则 ImportReference / Resolve 解析不到那些程序集
-        var asm = AssemblyDefinition.CreateAssembly(
+        using var asm = AssemblyDefinition.CreateAssembly(
             new AssemblyNameDefinition("IFixPatch", new Version(1, 0)), "IFixPatch",
             new ModuleParameters { Kind = ModuleKind.Dll, AssemblyResolver = src.Resolver });
         var module = asm.MainModule;
         var obj = module.TypeSystem.Object;
 
-        // 外部方法是否有返回值：查 DummyDll。必须构造时传入，推断过程要用。
-        var sigs = new InternalSignatures(p, map, id =>
-        {
-            if (id < 0 || id >= p.ExternMethods.Count) return false;
-            var em = p.ExternMethods[id];
-            var aqn = em.DeclaringTypeId >= 0 && em.DeclaringTypeId < p.ExternTypes.Count
-                ? p.ExternTypes[em.DeclaringTypeId] : null;
-            if (aqn == null) return false;
-            var md = src.FindMethod(aqn, em.Name, em.Params.Count);
-            return md != null && md.ReturnType.FullName != "System.Void";
-        });
+        var sigs = new InternalSignatures(p, map);
 
         var transpiler = new ILTranspiler(p, map, src, module);
 
@@ -62,7 +54,7 @@ public static class PatchDecompiler
         module.Types.Add(vmType);
         for (int i = 0; i < p.StaticFields.Count; i++)
         {
-            var ft = TypeRefOf(p, module, src, p.StaticFields[i].FieldTypeId) ?? obj;
+            var ft = TypeRefOf(p, module, src, p.StaticFields[i].FieldTypeId, report.Problems, $"VM static field#{i}") ?? obj;
             var fd = new FieldDefinition($"vmStatic{i}",
                 FieldAttributes.Public | FieldAttributes.Static, ft);
             vmType.Fields.Add(fd);
@@ -98,7 +90,7 @@ public static class PatchDecompiler
                 TypeReference ft = obj;
                 if (enc > 0)
                 {
-                    ft = TypeRefOf(p, module, src, enc - 1) ?? obj;
+                    ft = TypeRefOf(p, module, src, enc - 1, report.Problems, $"anonymous field#{i}.{k}") ?? obj;
                     sd.Locked[k] = !ReferenceEquals(ft, obj) && ft.FullName != obj.FullName;
                 }
                 var fd = new FieldDefinition($"f{k}", FieldAttributes.Public, ft);
@@ -120,8 +112,8 @@ public static class PatchDecompiler
             sd.Ctor = ctor;
 
             // 补丁里 CtorId 那个方法就是这个闭包的构造函数（体内首条即 base..ctor()）。
-            // 直接让它充当 .ctor，省得同一个闭包既有合成 ctor 又有个 `m14(object a0){ a0..ctor(); }`
-            // 的静态桩——后者除了噪声没有任何信息量。上面那具空体会被填体阶段整体覆盖。
+            // 复用为 .ctor，避免为同一构造过程再生成一个静态方法桩。
+            // 上面的占位方法体会在填体阶段替换。
             if (a.CtorId >= 0 && a.CtorId < p.Methods.Count && !p.Methods[a.CtorId].IsEmpty)
                 transpiler.InternalStubs[a.CtorId] = ctor;
 
@@ -159,23 +151,16 @@ public static class PatchDecompiler
                 foreach (var (pn, pt) in ps)
                     md.Parameters.Add(new ParameterDefinition(pn, ParameterAttributes.None, pt));
                 var b = md.Body.GetILProcessor();
-                if (ret.FullName != "System.Void")
-                {
-                    if (ret.IsValueType)
-                    {
-                        var v = new Mono.Cecil.Cil.VariableDefinition(ret); md.Body.Variables.Add(v);
-                        md.Body.InitLocals = true;
-                        b.Append(Mono.Cecil.Cil.Instruction.Create(Mono.Cecil.Cil.OpCodes.Ldloca, v));
-                        b.Append(Mono.Cecil.Cil.Instruction.Create(Mono.Cecil.Cil.OpCodes.Initobj, ret));
-                        b.Append(Mono.Cecil.Cil.Instruction.Create(Mono.Cecil.Cil.OpCodes.Ldloc, v));
-                    }
-                    else b.Append(Mono.Cecil.Cil.Instruction.Create(Mono.Cecil.Cil.OpCodes.Ldnull));
-                }
-                b.Append(Mono.Cecil.Cil.Instruction.Create(Mono.Cecil.Cil.OpCodes.Ret));
+                b.Append(Mono.Cecil.Cil.Instruction.Create(Mono.Cecil.Cil.OpCodes.Ldstr,
+                    $"VM side-table field {f.Name}; initializer method#{f.CctorId}. Analysis placeholder, not executable field access."));
+                b.Append(Mono.Cecil.Cil.Instruction.Create(Mono.Cecil.Cil.OpCodes.Newobj,
+                    module.ImportReference(typeof(NotSupportedException).GetConstructor([typeof(string)])!)));
+                b.Append(Mono.Cecil.Cil.Instruction.Create(Mono.Cecil.Cil.OpCodes.Throw));
                 newFieldType.Methods.Add(md);
                 return md;
             }
 
+            report.Problems.Add($"new field {f.Name}: side-table access and initializer method#{f.CctorId} are shown as explicit throwing placeholders");
             transpiler.NewFields[i] = new ILTranspiler.NewFieldAccessors
             {
                 GetInstance = Make($"Get_{tag}", ft, ("self", obj)),
@@ -195,23 +180,7 @@ public static class PatchDecompiler
         // 修复列表方法的签名是已知的（来自 DummyDll），作为类型流分析的锚点
         transpiler.InternalReturnsValue = id => id >= 0 && id < sigs.ReturnsValue.Length && sigs.ReturnsValue[id];
         TypeReference?[]? KnownParams(int id)
-        {
-            if (!fixByMethodId.TryGetValue(id, out var fx)) return null;
-            var declAqn0 = fx.Method.DeclaringTypeId >= 0 && fx.Method.DeclaringTypeId < p.ExternTypes.Count
-                ? p.ExternTypes[fx.Method.DeclaringTypeId] : null;
-            if (declAqn0 == null) return null;
-            var real = src.FindMethod(declAqn0, fx.Method.Name, fx.Method.Params.Count);
-            var list = new List<TypeReference?>();
-            if (real?.HasThis ?? true) list.Add(aqnRes.Resolve(declAqn0));
-            for (int i = 0; i < fx.Method.Params.Count; i++)
-            {
-                var pr = fx.Method.Params[i];
-                list.Add(pr.IsGeneric ? obj
-                    : (pr.TypeId >= 0 && pr.TypeId < p.ExternTypes.Count
-                        ? aqnRes.Resolve(p.ExternTypes[pr.TypeId]) : null) ?? obj);
-            }
-            return [.. list];
-        }
+            => fixByMethodId.TryGetValue(id, out var fix) ? transpiler.KnownFixParameters(fix.Method) : null;
 
         // 内部方法签名：参数类型从调用点反推，返回类型从被调方 Ret 反推（不动点迭代）
         var (inferredRet, inferredArgs) = transpiler.AnalyzeInternalTypes(sigs, KnownParams);
@@ -234,7 +203,7 @@ public static class PatchDecompiler
             }
             // 属于某个闭包的方法就发射成该闭包类型上的实例方法——它们本来就是那个类的成员。
             // 除了读起来自然（arg0 变成 this、字段访问不带前缀），委托创建点也才能还原成
-            // `new Action<int>(storey.m28)` 这种方法组形态，而不是函数指针强转。
+            // `new Action<int>(storey.Handle)` 这种方法组形态，而不是函数指针强转。
             // ArgCount 由 Ldarg 最大下标推出，方法体未读取 this 时可能为 0；
             // 但它仍是闭包的实例方法（<>c 上那些无捕获 lambda 就是这样），照样按实例发射。
             bool asInstance = transpiler.MethodStorey.TryGetValue(id, out int storeyIdx)
@@ -324,6 +293,38 @@ public static class PatchDecompiler
             Record(report, $"internal m{id}", r.Problems);
         }
 
+        transpiler.CompleteVirtualDispatch();
+
+        // A VM initializer is shared by fields carrying the same cctor id. Preserve that grouping.
+        foreach (var group in p.StaticFields.Select((field, index) => (field.CctorId, Index: index))
+                     .Where(field => field.CctorId >= 0).GroupBy(field => field.CctorId))
+        {
+            var holder = new TypeDefinition("IFixPatch", $"__VMStatics_Init{group.Key}",
+                TypeAttributes.Public | TypeAttributes.Abstract | TypeAttributes.Sealed, obj);
+            module.Types.Add(holder);
+            foreach (var field in group)
+            {
+                var definition = transpiler.VmStatics[field.Index];
+                vmType.Fields.Remove(definition); holder.Fields.Add(definition);
+            }
+            var initializer = new MethodDefinition(".cctor", MethodAttributes.Private | MethodAttributes.Static |
+                MethodAttributes.SpecialName | MethodAttributes.RTSpecialName, module.TypeSystem.Void);
+            holder.Methods.Add(initializer);
+            var il = initializer.Body.GetILProcessor();
+            if (transpiler.InternalStubs.TryGetValue(group.Key, out var target) && !target.HasThis && target.Parameters.Count == 0 && target.ReturnType.FullName == "System.Void")
+                il.Append(Mono.Cecil.Cil.Instruction.Create(Mono.Cecil.Cil.OpCodes.Call, target));
+            else
+            {
+                var message = $"VM static initializer method#{group.Key} has an unresolved signature";
+                report.Problems.Add(message);
+                il.Append(Mono.Cecil.Cil.Instruction.Create(Mono.Cecil.Cil.OpCodes.Ldstr, message));
+                il.Append(Mono.Cecil.Cil.Instruction.Create(Mono.Cecil.Cil.OpCodes.Newobj,
+                    module.ImportReference(typeof(NotSupportedException).GetConstructor([typeof(string)])!)));
+                il.Append(Mono.Cecil.Cil.Instruction.Create(Mono.Cecil.Cil.OpCodes.Throw));
+            }
+            il.Append(Mono.Cecil.Cil.Instruction.Create(Mono.Cecil.Cil.OpCodes.Ret));
+        }
+
         // ---- 栈平衡自查（诊断用，独立于本项目的 pop/push 估计）----
         foreach (var t in module.Types)
             foreach (var mm in t.Methods)
@@ -332,23 +333,22 @@ public static class PatchDecompiler
         // ---- 反编译 ----
         using var ms = new MemoryStream();
         asm.Write(ms);
+        report.AssemblyImage = ms.ToArray();
         ms.Position = 0;
 
         try
         {
-            var pe = new PEFile("IFixPatch", ms);
-            // 反编译器的解析器必须也能搜到 DummyDll：否则 Assembly-CSharp / UnityEngine 的类型
-            // 解析不到，ILSpy 会把它们的栈类型标成 Unknown（"missing references"），
-            // 产物里充满 "Unknown result type" 注释。
+            using var pe = new PEFile("IFixPatch", ms);
+            // C# 反编译器使用同一组元数据目录，避免可解析的引用类型被误标为 Unknown。
             var resolver = new UniversalAssemblyResolver(null, false, pe.DetectTargetFrameworkId());
-            resolver.AddSearchDirectory(src.DllDirectory);
+            foreach (var directory in src.DllDirectories) resolver.AddSearchDirectory(directory);
             var settings = new DecompilerSettings
             {
                 ThrowOnAssemblyResolveErrors = false,
                 ShowXmlDocumentation = false,
             };
             var dec = new CSharpDecompiler(pe, resolver, settings);
-            report.CSharp = dec.DecompileWholeModuleAsString();
+            report.CSharp = "// Analysis output. Inspect diagnostics before using this source.\n" + dec.DecompileWholeModuleAsString();
         }
         catch (Exception e)
         {
@@ -370,9 +370,11 @@ public static class PatchDecompiler
 
     /// <summary>解析补丁 externTypes 里的类型（供第一遍声明字段时用）。</summary>
     private static TypeReference? TypeRefOf(PatchFile p,
-        ModuleDefinition module, DummyDllSource src, int externTypeId)
+        ModuleDefinition module, DummyDllSource src, int externTypeId, List<string> problems, string field)
     {
         if (externTypeId < 0 || externTypeId >= p.ExternTypes.Count) return null;
-        return new AqnResolver(src, module).Resolve(p.ExternTypes[externTypeId]);
+        var type = new AqnResolver(src, module).Resolve(p.ExternTypes[externTypeId]);
+        if (type is null) problems.Add($"{field}: unresolved declared type {p.ExternTypes[externTypeId]}; object is an analysis placeholder");
+        return type;
     }
 }

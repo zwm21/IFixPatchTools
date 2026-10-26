@@ -21,13 +21,14 @@ public sealed class TranspileResult
 /// · 补丁不存局部变量类型（StackSpace 只有个数），所以用带类型的栈模拟推断：
 ///   在 stloc 处取栈顶类型，多次赋值冲突则退化为 object。
 /// </summary>
-public sealed class ILTranspiler
+public sealed partial class ILTranspiler
 {
     private readonly PatchFile _p;
     private readonly OpCodeMap _map;
     private readonly DummyDllSource _src;
     private readonly ModuleDefinition _module;
     private readonly AqnResolver _aqn;
+    private readonly HashSet<string> _analysisProblems = [];
     private readonly TypeReference _object, _int32, _int64, _single, _double, _string, _boolean, _intptr, _type;
 
     /// <summary>补丁内部方法 id → 合成桩；由 PatchDecompiler 预先声明好，使 Call 可前向引用。</summary>
@@ -104,31 +105,56 @@ public sealed class ILTranspiler
 
     private TypeReference? Import(string aqn) => _aqn.Resolve(aqn);
 
-    private TypeReference TypeOf(int externTypeId)
-        => (externTypeId >= 0 && externTypeId < _p.ExternTypes.Count
-            ? Import(_p.ExternTypes[externTypeId]) : null) ?? _object;
+    private TypeReference TypeOf(int externTypeId, List<string>? problems = null)
+    {
+        if (externTypeId < 0 && Storeys.TryGetValue(~externTypeId, out var storey)) return storey.Type;
+        var aqn = externTypeId >= 0 && externTypeId < _p.ExternTypes.Count ? _p.ExternTypes[externTypeId] : null;
+        var type = aqn is null ? null : Import(aqn);
+        if (type is null && problems is not null) problems.Add("无法解析类型操作数: " + (aqn ?? $"type#{externTypeId}"));
+        return type ?? _object;
+    }
 
     private MethodReference? MethodOf(int externMethodId)
     {
         if (externMethodId < 0 || externMethodId >= _p.ExternMethods.Count) return null;
-        var sig = _p.ExternMethods[externMethodId];
+        return ResolveMethod(_p.ExternMethods[externMethodId]);
+    }
+
+    private MethodReference? ResolveMethod(ExternMethodSig sig)
+    {
         var aqn = sig.DeclaringTypeId >= 0 && sig.DeclaringTypeId < _p.ExternTypes.Count
             ? _p.ExternTypes[sig.DeclaringTypeId] : null;
         if (aqn == null) return null;
         // 按参数类型选重载：补丁存了参数类型，只按个数匹配会选错（如 List<T> 的两个单参 ctor）
         var declRef = Import(aqn);
         // 递归替换：参数类型可能是 IEnumerable<T> 这类嵌套形态，只替换顶层不够。
-        // 此处只有类级实参可用（方法级实参要等重载选定后才知道），取不到就保留原样按开放形态比。
+        // 方法实参也已序列化在签名中；重载选择必须使用闭合后的参数类型。
+        var methodArguments = sig.IsGenericInstance ? sig.GenericArgTypeIds.Select(id => TypeOf(id)).ToArray() : null;
         string Render(TypeReference t)
-            => (Concretize(t, declRef as GenericInstanceType, null) ?? t).FullName;
+            => TypeSignatureKey(Concretize(t, declRef as GenericInstanceType, methodArguments) ?? t);
         var expected = sig.Params
             .Select(pr => pr.IsGeneric ? null
                 : (pr.TypeId >= 0 && pr.TypeId < _p.ExternTypes.Count
-                    ? Import(_p.ExternTypes[pr.TypeId])?.FullName : null))
+                    ? Import(_p.ExternTypes[pr.TypeId]) is { } type ? TypeSignatureKey(type) : null : null))
             .ToList();
-        var md = _src.FindMethodByParamTypes(aqn, sig.Name, expected, Render)
-                 ?? _src.FindMethod(aqn, sig.Name, sig.Params.Count);
-        if (md == null) return null;
+        if (sig.Params.Select((parameter, index) => !parameter.IsGeneric && expected[index] == null).Any(missing => missing))
+        {
+            _analysisProblems.Add("无法解析外部方法参数类型: " + aqn + "::" + sig.Name);
+            return null;
+        }
+        var arity = sig.IsGenericInstance ? sig.GenericArgTypeIds.Count : 0;
+        var candidates = _src.FindType(aqn)?.Methods.Where(method => method.Name == sig.Name &&
+            method.Parameters.Count == sig.Params.Count && method.GenericParameters.Count == arity).Where(method =>
+            method.Parameters.Select((parameter, index) => sig.Params[index].IsGeneric
+                ? GenericSignatureName(parameter.ParameterType, declRef as GenericInstanceType) == sig.Params[index].GenericName
+                : Render(parameter.ParameterType) == expected[index]).All(matches => matches)).ToArray();
+        if (candidates == null || candidates.Length == 0) return null;
+        if (candidates.Length > 1)
+        {
+            _analysisProblems.Add("外部方法签名存在歧义: " + aqn + "::" + sig.Name);
+            return null;
+        }
+        var md = candidates[0];
 
         try
         {
@@ -150,6 +176,34 @@ public sealed class ILTranspiler
         }
         catch { return null; }
     }
+
+    private static string TypeSignatureKey(TypeReference type)
+        => type switch
+        {
+            GenericInstanceType generic => TypeSignatureKey(generic.ElementType) + "<" +
+                string.Join(",", generic.GenericArguments.Select(TypeSignatureKey)) + ">",
+            ArrayType array => TypeSignatureKey(array.ElementType) + "[" + new string(',', array.Rank - 1) + "]",
+            ByReferenceType reference => TypeSignatureKey(reference.ElementType) + "&",
+            PointerType pointer => TypeSignatureKey(pointer.ElementType) + "*",
+            _ => type.FullName + "@" + (type.Scope is ModuleDefinition module
+                ? module.Assembly.Name.FullName : type.Scope.ToString())
+        };
+
+    // IFix stores method type parameters by name and composite shapes without assembly names.
+    // Keep those shapes during overload matching; a generic parameter is not a wildcard.
+    private string GenericSignatureName(TypeReference type, GenericInstanceType? declaringType)
+        => type switch
+        {
+            GenericParameter parameter when parameter.Type == GenericParameterType.Method => parameter.Name,
+            GenericParameter parameter => Concretize(parameter, declaringType, null) is { } concrete
+                ? GenericSignatureName(concrete, null) : parameter.Name,
+            ArrayType array => GenericSignatureName(array.ElementType, declaringType) + "[" + new string(',', array.Rank - 1) + "]",
+            ByReferenceType reference => GenericSignatureName(reference.ElementType, declaringType) + "&",
+            PointerType pointer => GenericSignatureName(pointer.ElementType, declaringType) + "*",
+            GenericInstanceType generic => generic.ElementType.FullName.Replace('/', '+') + "[" +
+                string.Join(",", generic.GenericArguments.Select(argument => GenericSignatureName(argument, declaringType))) + "]",
+            _ => type.FullName.Replace('/', '+')
+        };
 
     /// <summary>把成员引用的宿主换成构造泛型实例（Cecil 的标准做法）。</summary>
     private static MethodReference MakeHostInstanceGeneric(MethodReference self, GenericInstanceType host)
@@ -250,7 +304,7 @@ public sealed class ILTranspiler
 
     /// <summary>
     /// 只声明修复列表方法的签名并登记到桩表，不填方法体。
-    /// 必须与填体分成两遍：修复列表方法之间也会互相调用（如 method#174 调 method#175），
+    /// 必须与填体分成两遍：修复列表方法可能调用稍后声明的方法，
     /// 若边声明边填体，先处理的那个引用后面还没声明的方法就会失败。
     /// </summary>
     public MethodDefinition? DeclareFix(FixEntry fx, TypeDefinition container, List<string> problems)
@@ -264,10 +318,18 @@ public sealed class ILTranspiler
         if (declAqn == null) { problems.Add("声明类型无效"); return null; }
 
         var declType = Import(declAqn);
-        var realMethod = _src.FindMethod(declAqn, sig.Name, sig.Params.Count);
-        var returnType = realMethod != null
-            ? (_module.ImportReference(realMethod.ReturnType) ?? _object)
-            : _object;
+        var realMethod = ResolveMethod(sig);
+        TypeReference Close(TypeReference type)
+        {
+            var closed = Concretize(type, realMethod);
+            if (closed == null || closed.ContainsGenericParameter)
+            {
+                problems.Add("修复方法签名缺少泛型实参: " + sig.Name);
+                return _object;
+            }
+            return _module.ImportReference(closed);
+        }
+        var returnType = realMethod != null ? Close(realMethod.ReturnType) : _object;
         if (realMethod == null) res.Problems.Add("目标程序集里找不到原方法，返回类型退化为 object");
 
         // 统一发射为静态方法；实例方法把 this 显式化为首参，保证类型正确
@@ -280,7 +342,9 @@ public sealed class ILTranspiler
             method.Parameters.Add(new ParameterDefinition("self", ParameterAttributes.None, declType));
         for (int i = 0; i < sig.Params.Count; i++)
         {
-            var pt = sig.Params[i].IsGeneric ? _object : TypeOf(sig.Params[i].TypeId);
+            var pt = sig.Params[i].IsGeneric && realMethod != null
+                ? Close(realMethod.Parameters[i].ParameterType)
+                : TypeOf(sig.Params[i].TypeId, problems);
             var pn = realMethod != null && i < realMethod.Parameters.Count
                 ? realMethod.Parameters[i].Name : $"arg{i}";
             method.Parameters.Add(new ParameterDefinition(pn, ParameterAttributes.None, pt));
@@ -292,14 +356,34 @@ public sealed class ILTranspiler
         return method;
     }
 
+    /// <summary>原始签名闭合后的参数（含实例接收者），供内部类型分析使用同一重载解析结果。</summary>
+    internal TypeReference?[]? KnownFixParameters(ExternMethodSig signature)
+    {
+        var method = ResolveMethod(signature);
+        if (method == null) return null;
+        var parameters = new List<TypeReference?>();
+        if (method.HasThis) parameters.Add(method.DeclaringType);
+        foreach (var parameter in method.Parameters)
+            parameters.Add(ImportOrNull(Concretize(parameter.ParameterType, method)) ?? _object);
+        return [.. parameters];
+    }
+
     /// <summary>为已声明的内部方法桩填充方法体（签名由 InternalSignatures 推出）。</summary>
     public TranspileResult TranspileInternal(IFixMethod m, MethodDefinition stub)
     {
         var res = new TranspileResult();
         EmitBody(m, stub, res.Problems);
+        res.Problems.AddRange(TakeAnalysisProblems());
         res.Method = stub;
         res.Ok = true;
         return res;
+    }
+
+    internal IReadOnlyList<string> TakeAnalysisProblems()
+    {
+        var problems = _analysisProblems.ToArray();
+        _analysisProblems.Clear();
+        return problems;
     }
 
     /// <summary>解码 → 推断局部类型 → 发射指令 → 回填分支 → 建异常块。</summary>
@@ -322,7 +406,9 @@ public sealed class ILTranspiler
         // 属于哪个闭包——发射时要靠它选对 FieldDefinition。
         var simObs = new SimObservations();
         SimulateForLocals(decoded, method, localTypes, simObs);
+        problems.AddRange(simObs.Problems);
         _siteStorey = simObs.FieldSiteStorey;
+        _virtualSiteStorey = simObs.VirtualSiteStorey;
         _ldftnRewrite = PlanDelegateTargets(decoded);
         for (int i = 0; i < localCount; i++)
             body.Variables.Add(new VariableDefinition(localTypes[i] ?? _object));
@@ -335,8 +421,9 @@ public sealed class ILTranspiler
         foreach (var d in decoded)
         {
             if (d.Mnemonic == "StackSpace") continue;
-            var emitted = Emit(il, d, method, body, problems, pending, pendingSwitch);
-            if (emitted != null) byIndex[d.Index] = emitted;
+            var first = body.Instructions.Count;
+            Emit(il, d, method, body, problems, pending, pendingSwitch);
+            if (body.Instructions.Count > first) byIndex[d.Index] = body.Instructions[first];
         }
 
         // 分支回填
@@ -351,18 +438,17 @@ public sealed class ILTranspiler
             Instruction? At(int idx) => byIndex.TryGetValue(idx, out var x) ? x : null;
             var tryStart = At(eh.TryStart); var tryEnd = At(eh.TryEnd);
             var hStart = At(eh.HandlerStart); var hEnd = At(eh.HandlerEnd);
-            if (tryStart == null || tryEnd == null || hStart == null)
+            if (tryStart == null || tryEnd == null && eh.TryEnd != m.Code.Count || hStart == null)
             {
                 problems.Add($"异常块边界越界 try[{eh.TryStart}..{eh.TryEnd}) handler[{eh.HandlerStart}..{eh.HandlerEnd})");
                 continue;
             }
-            var h = new ExceptionHandler(eh.HandlerType switch
+            if (eh.HandlerType is 1 or 4)
             {
-                0 => ExceptionHandlerType.Catch,
-                1 => ExceptionHandlerType.Filter,
-                2 => ExceptionHandlerType.Finally,
-                _ => ExceptionHandlerType.Fault,
-            })
+                problems.Add($"不支持的 VM 异常处理类型: {eh.HandlerType}");
+                continue;
+            }
+            var h = new ExceptionHandler(eh.HandlerType == 0 ? ExceptionHandlerType.Catch : ExceptionHandlerType.Finally)
             {
                 TryStart = tryStart,
                 TryEnd = tryEnd,
@@ -375,11 +461,18 @@ public sealed class ILTranspiler
         }
 
         body.InitLocals = localCount > 0;
-        if (body.Instructions.Count == 0 || body.Instructions[^1].OpCode != OpCodes.Ret)
+        // An extra ret can become part of an open-ended exception handler, where
+        // returning is illegal even when the instruction follows an unconditional throw.
+        if (body.Instructions.Count == 0 || body.Instructions[^1].OpCode.FlowControl is not
+                (FlowControl.Return or FlowControl.Throw or FlowControl.Branch))
+        {
+            problems.Add("方法体缺少终止指令，已添加分析用 ret");
             il.Append(Instruction.Create(OpCodes.Ret));
+        }
     }
     /// <summary>当前方法内，实例形式负数字段操作数的接收者闭包（EmitBody 每次重置）。</summary>
     private Dictionary<int, int> _siteStorey = [];
+    private Dictionary<int, int> _virtualSiteStorey = [];
 
     /// <summary>当前方法内，应改写成 Ldftn 的 Ldc_I4 站点：指令下标 → 委托目标方法。</summary>
     private Dictionary<int, MethodDefinition> _ldftnRewrite = [];
@@ -440,7 +533,7 @@ public sealed class ILTranspiler
 
         // 播种：闭包方法没有 Call 调用点（经 wrapper 走委托），但 IFix 对闭包发射的是
         // `Ldc_I4 <methodId>` 紧跟 `Newobj <委托>::.ctor`，于是委托的 Invoke 签名
-        // 就是该方法的精确签名。实测 31 处该模式里 30 处是委托 ctor 且目标槽有效。
+        // 提供该方法的参数与返回值契约；还需确认构造目标确为委托且方法槽有效。
         SeedFromDelegateSites(decodedCache, sigs, knownParams, ret, args);
         if (SeedAnonStoreys) SeedFromAnonStoreys(sigs, knownParams, ret, args);
 
@@ -488,7 +581,7 @@ public sealed class ILTranspiler
                 // 真正的类型只能从赋值现场反推，故并入同一个不动点——闭包字段定型后又会让
                 // 读取它的那些局部变量定型，互相促进。
                 // 委托目标对象 → 目标方法的 arg0。闭包类的 arg0 已由 MethodStorey 锁定，
-                // 这里补的是「目标是原类型实例」的那批（如 new Action(self, m35)）。
+                // 这里补的是「目标是原类型实例」的那批（如 new Action(self, Handle)）。
                 foreach (var (mid, tt) in obs.DelegateTargets)
                 {
                     if (mid < 0 || mid >= n || knownParams(mid) != null) continue;
@@ -582,7 +675,7 @@ public sealed class ILTranspiler
 
     /// <summary>
     /// 用委托的 Invoke 契约把被低估的内部方法元数补齐（只增不减）。没有这一步，像
-    /// <c>void m249()</c> 这种空实现会被当成 0 参，做委托目标时签名对不上，
+    /// 空实现可能被推断为 0 参，作为委托目标时签名会不匹配，
     /// 反编译只能退化成函数指针强转而不是方法组。
     /// </summary>
     private void FixDelegateArities(InternalSignatures sigs)
@@ -601,7 +694,11 @@ public sealed class ILTranspiler
                 MethodDefinition? invoke = null;
                 try { invoke = ctor?.DeclaringType?.Resolve()?.Methods.FirstOrDefault(x => x.Name == "Invoke"); }
                 catch { }
-                if (invoke == null) continue;
+                if (invoke == null)
+                {
+                    _analysisProblems.Add("委托元数据缺少 Invoke 方法: " + ctor!.DeclaringType.FullName);
+                    continue;
+                }
                 sigs.ArgCount[target] = Math.Max(sigs.ArgCount[target], invoke.Parameters.Count + 1);
             }
         }
@@ -643,7 +740,11 @@ public sealed class ILTranspiler
                 // 闭包方法的首参是闭包对象（委托的 target），其后才是 Invoke 的参数
                 var slot = args[target];
                 int offset = sigs.ArgCount[target] - invoke.Parameters.Count;
-                if (offset is < 0 or > 1) continue;
+                if (offset is < 0 or > 1)
+                {
+                    _analysisProblems.Add("委托目标签名与 Invoke 参数不兼容: method#" + target);
+                    continue;
+                }
                 for (int i = 0; i < invoke.Parameters.Count; i++)
                 {
                     int pos = offset + i;
@@ -663,7 +764,7 @@ public sealed class ILTranspiler
     /// 故 Boolean/Char/枚举/Int32 等在栈上无从区分，把它们判成「冲突」再退化成 object 是过度保守的。</summary>
     private enum StackKind { Other, I4, I8, F }
 
-    private static StackKind KindOf(TypeReference? t)
+    private StackKind KindOf(TypeReference? t)
     {
         if (t == null) return StackKind.Other;
         switch (t.MetadataType)
@@ -687,13 +788,16 @@ public sealed class ILTranspiler
                 // 枚举按底层类型归族：value__ 是它唯一的实例字段
                 try
                 {
-                    if (t.Resolve() is { IsEnum: true } td)
+                    var definition = t.Resolve();
+                    if (definition == null) _analysisProblems.Add("无法解析值类型: " + t.FullName);
+                    if (definition is { IsEnum: true } td)
                     {
                         var underlying = td.Fields.FirstOrDefault(f => !f.IsStatic)?.FieldType;
+                        if (underlying == null) _analysisProblems.Add("枚举缺少底层值字段: " + t.FullName);
                         return underlying == null ? StackKind.Other : KindOf(underlying);
                     }
                 }
-                catch { /* 解析不到就当普通值类型 */ }
+                catch { _analysisProblems.Add("无法解析值类型: " + t.FullName); }
                 return StackKind.Other;
             default:
                 return StackKind.Other;
@@ -716,9 +820,9 @@ public sealed class ILTranspiler
     }
 
     /// <summary>
-    /// 两个引用类型的最近公共基类。同一个访问器桩会被不同子类调用（<c>m4</c> 同时收到
-    /// CustomMissionTask 和 TotalRechargeTask），直接判冲突退化成 object 就丢掉了它们真正的
-    /// 声明类型 BaseTask。接口不参与——多重实现下没有唯一解。
+    /// 两个引用类型的最近公共基类。不同派生类共用访问器时，
+    /// 直接退化成 object 会丢失其共有的基类信息。
+    /// 接口不参与，因为多重实现可能没有唯一结果。
     /// </summary>
     private TypeReference? CommonBase(TypeReference a, TypeReference b)
     {
@@ -730,6 +834,7 @@ public sealed class ILTranspiler
             {
                 chain.Add(t);
                 var td = t.Resolve();
+                if (td == null) _analysisProblems.Add("无法解析引用类型的基类链: " + t.FullName);
                 if (td?.BaseType == null) break;
                 t = td.BaseType;
             }
@@ -739,11 +844,12 @@ public sealed class ILTranspiler
                 if (names.Contains(t.FullName))
                     return t.FullName == _object.FullName ? null : ImportOrNull(t);
                 var td = t.Resolve();
+                if (td == null) _analysisProblems.Add("无法解析引用类型的基类链: " + t.FullName);
                 if (td?.BaseType == null) break;
                 t = td.BaseType;
             }
         }
-        catch { /* 解析不到基类链就放弃 */ }
+        catch { _analysisProblems.Add("无法解析引用类型的基类链: " + a.FullName + " / " + b.FullName); }
         return null;
     }
 
@@ -766,6 +872,8 @@ public sealed class ILTranspiler
             slot = unified;
             return true;
         }
+        if (slot.IsValueType || seen.IsValueType)
+            _analysisProblems.Add("类型观测包含不兼容的值类型: " + slot.FullName + " / " + seen.FullName);
         slot = _object;
         return true;
     }
@@ -785,8 +893,8 @@ public sealed class ILTranspiler
     /// 签名里留 <c>!N</c>，改成具体类型反而不合法。但把 <c>!1</c> 当作某个局部变量的类型毫无意义，
     /// 推断侧必须具体化，取不到就返回 null 退化为 object。
     /// </summary>
-    private static TypeReference? Concretize(TypeReference? t, GenericInstanceType? classArgs,
-        GenericInstanceMethod? methodArgs)
+    private TypeReference? Concretize(TypeReference? t, GenericInstanceType? classArgs,
+        IList<TypeReference>? methodArgs)
     {
         switch (t)
         {
@@ -795,9 +903,11 @@ public sealed class ILTranspiler
             case GenericParameter gp:
                 {
                     var src = gp.Type == GenericParameterType.Method
-                        ? methodArgs?.GenericArguments
+                        ? methodArgs
                         : classArgs?.GenericArguments;
-                    return src != null && gp.Position < src.Count ? src[gp.Position] : null;
+                    if (src != null && gp.Position < src.Count) return src[gp.Position];
+                    _analysisProblems.Add("类型推断缺少泛型实参: " + gp.FullName);
+                    return null;
                 }
             case GenericInstanceType git:
                 {
@@ -832,7 +942,7 @@ public sealed class ILTranspiler
 
     /// <summary>按某个方法引用的宿主/方法实参具体化其签名里的类型。</summary>
     private TypeReference? Concretize(TypeReference? t, MethodReference? mr)
-        => Concretize(t, mr?.DeclaringType as GenericInstanceType, mr as GenericInstanceMethod);
+        => Concretize(t, mr?.DeclaringType as GenericInstanceType, (mr as GenericInstanceMethod)?.GenericArguments);
 
     /// <summary>
     /// 找出「补丁里带方法体、却没有任何引用点」的方法槽。引用点共六类：内部调用、委托创建点、
@@ -861,8 +971,9 @@ public sealed class ILTranspiler
             for (int k = 0; k < code.Count; k++)
             {
                 var d = code[k];
-                if (d.Mnemonic is "Call" or "Callvirt" or "Callvirtvirt")
-                    referenced.Add(d.Operand & 0xFFFF);
+                if (d.Mnemonic is "Call" or "Callvirt") referenced.Add(d.Operand & 0xFFFF);
+                else if (d.Mnemonic is "Callvirtvirt" or "Ldvirtftn2")
+                    foreach (var target in PatchDispatch.Targets(_p, d.Operand & 0xffff)) referenced.Add(target);
                 else if (d.Mnemonic == "Newobj" && k > 0 && code[k - 1].Mnemonic == "Ldc_I4"
                          && IsDelegateCtor(d.Operand & 0xFFFF))
                     referenced.Add(code[k - 1].Operand);
@@ -909,9 +1020,17 @@ public sealed class ILTranspiler
     /// <summary>导入到合成模块；具体化失败（含未消解的泛型形参）时返回 null，交由上层退化为 object。</summary>
     private TypeReference? ImportOrNull(TypeReference? t)
     {
-        if (t == null || t.ContainsGenericParameter) return null;
-        try { return _module.ImportReference(t); }
-        catch { return null; }
+        if (t == null) return null;
+        try
+        {
+            if (t.ContainsGenericParameter || t is not TypeSpecification && t.Resolve() is { HasGenericParameters: true })
+            {
+                _analysisProblems.Add("类型推断缺少泛型实参: " + t.FullName);
+                return null;
+            }
+            return _module.ImportReference(t);
+        }
+        catch { _analysisProblems.Add("无法导入推断类型: " + t.FullName); return null; }
     }
 
     // ---------- 匿名类/闭包（storey） ----------
@@ -1075,7 +1194,12 @@ public sealed class ILTranspiler
             return true;
         }
         var st = StoreyType(storey);
-        if (st == null || fd.FieldType.FullName != _object.FullName) return false;
+        if (st == null) return false;
+        if (fd.FieldType.FullName != _object.FullName)
+        {
+            _analysisProblems.Add("VM 静态字段声明类型与匿名对象不兼容: " + fd.FieldType.FullName);
+            return false;
+        }
         _vmStaticStoreyKind[vmIndex] = storey;
         fd.FieldType = st;
         return true;
@@ -1099,11 +1223,11 @@ public sealed class ILTranspiler
         {
             // ---- 参数/局部 ----
             case "Ldarg":
-                ins = ArgAccess(OpCodes.Ldarg, d.Operand, method); break;
+                ins = ArgAccess(OpCodes.Ldarg, d.Operand, method, problems); break;
             case "Ldarga":
-                ins = ArgAccess(OpCodes.Ldarga, d.Operand, method); break;
+                ins = ArgAccess(OpCodes.Ldarga, d.Operand, method, problems); break;
             case "Starg":
-                ins = ArgAccess(OpCodes.Starg, d.Operand, method); break;
+                ins = ArgAccess(OpCodes.Starg, d.Operand, method, problems); break;
             case "Ldloc":
                 ins = LocalAccess(OpCodes.Ldloc, d.Operand, body); break;
             case "Ldloca":
@@ -1137,12 +1261,6 @@ public sealed class ILTranspiler
                         return EmitPlaceholder(il);
                     }
                     var op = mn == "Newobj" ? OpCodes.Newobj : OpCodes.Call;
-                    // 虚调用在非虚方法上会失败，退化为 Call。Resolve 可能因缺程序集抛，失败就按原样发射。
-                    if (op == OpCodes.Callvirt)
-                    {
-                        try { if (mr.Resolve() is { IsVirtual: false }) op = OpCodes.Call; }
-                        catch { /* 解析不到就保留 Callvirt */ }
-                    }
                     ins = Instruction.Create(op, mr);
                     break;
                 }
@@ -1150,7 +1268,6 @@ public sealed class ILTranspiler
             // 不是 extern 索引（VM 的 Code.Callvirt 分支完全不碰 externMethods）。
             case "Call":
             case "Callvirt":
-            case "Callvirtvirt":
                 {
                     int targetId = d.Operand & 0xFFFF;
                     if (!InternalStubs.TryGetValue(targetId, out var stub))
@@ -1161,6 +1278,9 @@ public sealed class ILTranspiler
                     ins = Instruction.Create(OpCodes.Call, stub);
                     break;
                 }
+            case "Callvirtvirt":
+                ins = Instruction.Create(OpCodes.Call, VirtualDispatcher(d.Operand & 0xffff, (int)((uint)d.Operand >> 16), false, _virtualSiteStorey.GetValueOrDefault(d.Index, -1)));
+                break;
             case "Newanon":
                 {
                     if (!Storeys.TryGetValue(d.Operand, out var sd))
@@ -1172,8 +1292,10 @@ public sealed class ILTranspiler
                     break;
                 }
             case "Ldvirtftn2":
-                problems.Add($"[{d.Index}] Ldvirtftn2 走 vtable 槽位 [{d.Operand}]，无法静态确定目标");
-                return EmitPlaceholder(il);
+                il.Append(Instruction.Create(OpCodes.Pop));
+                il.Append(Instruction.Create(OpCodes.Dup));
+                ins = Instruction.Create(OpCodes.Call, VirtualDispatcher(d.Operand & 0xffff, 1, true, _virtualSiteStorey.GetValueOrDefault(d.Index, -1)));
+                break;
 
             // ---- 函数指针：operand 直接是 extern 方法索引，不带 argc 打包 ----
             case "Ldftn":
@@ -1276,7 +1398,17 @@ public sealed class ILTranspiler
 
             // ---- 类型操作数 ----
             case "Ldtype":
-                ins = Instruction.Create(OpCodes.Ldtoken, TypeOf(d.Operand)); break;
+                {
+                    var fromHandle = _src.FindMethod("System.Type, mscorlib", "GetTypeFromHandle", 1);
+                    if (fromHandle is null)
+                    {
+                        problems.Add($"[{d.Index}] Ldtype 无法解析 Type.GetTypeFromHandle");
+                        return EmitPlaceholder(il);
+                    }
+                    il.Append(Instruction.Create(OpCodes.Ldtoken, TypeOf(d.Operand, problems)));
+                    ins = Instruction.Create(OpCodes.Call, _module.ImportReference(fromHandle));
+                    break;
+                }
             case "Castclass":
             case "Isinst":
             case "Box":
@@ -1296,8 +1428,10 @@ public sealed class ILTranspiler
             case "Ldelema":
             case "Ldtoken":
                 {
+                    if (mn is "Cpobj" or "Mkrefany" or "Refanyval")
+                        problems.Add($"[{d.Index}] VM 不支持助记符 {mn}");
                     OpCodeTable.TryGet(mn, out var top);
-                    ins = Instruction.Create(top, TypeOf(d.Operand));
+                    ins = Instruction.Create(top, TypeOf(d.Operand, problems));
                     break;
                 }
 
@@ -1350,6 +1484,7 @@ public sealed class ILTranspiler
                         problems.Add($"[{d.Index}] {mn} 需要操作数但未处理（{op.OperandType}）");
                         return EmitPlaceholder(il);
                     }
+                    if (mn is "Endfilter" or "Tail") problems.Add($"[{d.Index}] VM 不支持助记符 {mn}");
                     ins = Instruction.Create(op);
                     break;
                 }
@@ -1371,7 +1506,7 @@ public sealed class ILTranspiler
     /// IFix 的 Ldarg 下标里 0 恒为 this。闭包方法发射成闭包类型上的实例方法后，Cecil 的
     /// Parameters 不含 this，故下标要整体右移一位，0 号取 ThisParameter。
     /// </summary>
-    private static Instruction ArgAccess(OpCode op, int index, MethodDefinition method)
+    private static Instruction ArgAccess(OpCode op, int index, MethodDefinition method, List<string> problems)
     {
         if (index < 0) return Instruction.Create(OpCodes.Ldnull);
         if (method.HasThis)
@@ -1381,6 +1516,7 @@ public sealed class ILTranspiler
         }
         if (index < method.Parameters.Count)
             return Instruction.Create(op, method.Parameters[index]);
+        problems.Add($"参数索引超出方法签名: {index}");
         return Instruction.Create(OpCodes.Ldnull);
     }
 
@@ -1409,10 +1545,12 @@ public sealed class ILTranspiler
     /// <summary>模拟一遍得到的观测：局部类型、内部调用点的实参类型、各 Ret 处的栈顶类型。</summary>
     public sealed class SimObservations
     {
+        public List<string> Problems = [];
         public List<(int TargetId, List<TypeReference?> Args)> InternalCalls = [];
         public List<TypeReference?> RetTypes = [];
         /// <summary>实例形式的负数字段操作数：指令下标 → 接收者所属的闭包下标。</summary>
         public Dictionary<int, int> FieldSiteStorey = [];
+        public Dictionary<int, int> VirtualSiteStorey = [];
         /// <summary>观测到的 <c>storey.f[i] = 值</c>。</summary>
         public List<(int Storey, int Field, TypeReference? Value)> StoreyStores = [];
         /// <summary>观测到的 <c>vmStatic[k] = 某闭包实例</c>。</summary>
@@ -1516,6 +1654,14 @@ public sealed class ILTranspiler
                 prov.Clear();
                 prov.AddRange(snap.Prov);
             }
+            else if (snapshots.TryGetValue(d.Index, out var incoming) && incoming.Stack.Count == stack.Count)
+                for (var index = 0; index < stack.Count; index++)
+                {
+                    var merged = stack[index];
+                    Merge(ref merged, incoming.Stack[index]);
+                    stack[index] = merged;
+                    if (prov[index] != incoming.Prov[index]) prov[index] = -1;
+                }
             afterUnconditional = false;
 
             switch (d.Mnemonic)
@@ -1539,7 +1685,12 @@ public sealed class ILTranspiler
                             var prev = localTypes[d.Operand];
                             if (prev == null) localTypes[d.Operand] = t;
                             else if (t != null && prev.FullName != t.FullName)
-                                localTypes[d.Operand] = UnifySameKind(prev, t) ?? _object;
+                            {
+                                var unified = UnifySameKind(prev, t);
+                                if (unified == null && (prev.IsValueType || t.IsValueType))
+                                    obs?.Problems.Add($"局部变量 {d.Operand} 包含不兼容的值类型: {prev.FullName} / {t.FullName}");
+                                localTypes[d.Operand] = unified ?? _object;
+                            }
                         }
                         break;
                     }
@@ -1550,6 +1701,7 @@ public sealed class ILTranspiler
                 case "Ldstr": Push(_string); break;
                 case "Ldnull": Push(_object); break;
                 case "Ldtype": Push(_type); break;
+                case "Ldtoken": Push(Import("System.RuntimeTypeHandle, mscorlib")); break;
 
                 case "CallExtern":
                     {
@@ -1580,10 +1732,21 @@ public sealed class ILTranspiler
                         var args = new List<TypeReference?>();
                         for (int k = 0; k < argc; k++) args.Add(Pop());
                         args.Reverse();                       // 栈是逆序弹出的
-                        obs?.InternalCalls.Add((target, args));
-                        var rt2 = internalReturnType(target);
-                        if (rt2 != null) Push(rt2);
-                        else if (InternalReturnsValue(target)) Push(null);
+                        var receiver = d.Mnemonic == "Callvirtvirt" && args.Count > 0 ? StoreyOf(args[0]) : -1;
+                        if (receiver >= 0) obs?.VirtualSiteStorey.TryAdd(d.Index, receiver);
+                        var targets = d.Mnemonic == "Callvirtvirt"
+                            ? receiver >= 0 && target < _p.AnonStoreys[receiver].VTable.Count
+                                ? new[] { _p.AnonStoreys[receiver].VTable[target] }.Where(id => id >= 0).ToArray()
+                                : PatchDispatch.Targets(_p, target).ToArray()
+                            : [target];
+                        TypeReference? resultType = null;
+                        foreach (var candidate in targets)
+                        {
+                            obs?.InternalCalls.Add((candidate, args));
+                            Merge(ref resultType, internalReturnType(candidate));
+                        }
+                        if (resultType != null) Push(resultType);
+                        else if (targets.Any(InternalReturnsValue)) Push(null);
                         break;
                     }
                 case "Newanon":
@@ -1606,7 +1769,12 @@ public sealed class ILTranspiler
                         }
                         break;
                     }
-                case "Ldvirtftn2": Push(_intptr); break;
+                case "Ldvirtftn2":
+                    Pop();
+                    if (stack.Count == 0) obs?.Problems.Add("Ldvirtftn2 缺少接收者");
+                    var pointerReceiver = stack.Count > 0 ? StoreyOf(stack[^1]) : -1;
+                    if (pointerReceiver >= 0) obs?.VirtualSiteStorey.TryAdd(d.Index, pointerReceiver);
+                    Push(_intptr); break;
 
                 // 负数字段操作数在 IFix 里有两种语义，必须按「实例形式 / 静态形式」分流：
                 //   Ldfld/Ldflda/Stfld  → 栈上那个闭包实例的第 k 个字段（下标各闭包自己从 0 起算）
@@ -1687,7 +1855,8 @@ public sealed class ILTranspiler
                 case "Initobj": Pop(); Declare(lastProv, TypeOf(d.Operand)); break;
 
                 case "Dup":
-                    if (stack.Count > 0) Push(stack[^1], prov[^1]); else Push(null);
+                    if (stack.Count > 0) Push(stack[^1], prov[^1]);
+                    else { obs?.Problems.Add("Dup 的求值栈为空"); Push(null); }
                     break;
                 case "Pop": Pop(); break;
                 case "Ret":

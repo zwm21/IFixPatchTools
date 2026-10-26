@@ -119,7 +119,7 @@ IFixPatch.Decompiler decompile patch.bytes --dummy-dll DummyDll --opcode-map myM
 
 - 补丁由 `IFix.Core/CodeTranslator` 以 `BinaryWriter` 串行写出，无 TOC，以 `BinaryReader` 按序读取（7-bit 字符串 + 小端）；所有类型/方法/字段/字符串均为侧表下标，侧表保留完整名字（运行时反射定位），可读性接近无 PDB 的 release 程序集。
 - 接口匿名类的 `slot` 表长度取决于接口声明的 `public` 实例方法数（与 `readSlotInfo` 的 `GetMethods` 遍历一致），需元数据源提供。
-- `StackSpace`、`Ldc_I8/R8`、`Switch` 会借用后续槽位存放立即数或目标表，解码与字符串引用计数需同流程处理。
+- `StackSpace` 是解释器读取的方法序言，不能作为普通分支目标；`Ldc_I8/R8` 和 `Switch` 借用后续槽位存放立即数或目标表，解码与字符串引用计数需跳过这些数据槽。
 
 实现机制与信息边界见 [docs/Development.md](docs/Development.md)。
 
@@ -131,13 +131,17 @@ IFixPatch.Decompiler decompile patch.bytes --dummy-dll DummyDll --opcode-map myM
 
 ## 验证与局限
 
-[合成输入回归](../CONTRIBUTING.md#构建与验证)检查离线工具行为。
+[roundtrip 示例](../samples/roundtrip/README.md)可用于检查 IR 与 IL 文本往返。
 实际补丁应提供同版本元数据，并分别检查完整解析、opcode 映射、转译诊断及栈检查结果。
 字节往返不等于业务语义或客户端运行验证。
 
-- `Callvirtvirt` / `Ldvirtftn2` 的目标需要额外的运行时 vtable 布局信息。
+- `Callvirtvirt` / `Ldvirtftn2` 按补丁内匿名类 vtable 生成接收者派发，不将槽号当作方法号。
+- VM 静态字段按初始化方法分组；新增旁表字段显式输出抛异常的分析占位，并记录诊断。
+- 报告含降级或栈检查问题，或无法生成 C# 时返回非零退出码；分析输出不作为等价补丁源码。
 - 零引用内部方法和无读写现场的闭包字段可能无法恢复具体签名或类型。
 - `magic` 仅读取；opcode literal 缺失时需要补充映射来源。
+
+IL 中的 `bits64=0x...` 为 `Ldc_I8/R8` 的原始位模式，编辑该字段可修改值；显示值只供阅读。
 
 ## 依赖
 
