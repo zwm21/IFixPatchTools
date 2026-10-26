@@ -1,0 +1,22 @@
+<Solution>
+  <Folder Name="/IFixPatch.Core/">
+    <Project Path="IFixPatch.Core/IFixPatch.Core.csproj" />
+    <Project Path="IFixPatch.Core/tests/IFixPatch.Core.Tests.csproj" />
+  </Folder>
+  <Folder Name="/IFixPatch.Decompiler/">
+    <Project Path="IFixPatch.Decompiler/IFixPatch.Decompiler.csproj" />
+    <Project Path="IFixPatch.Decompiler/tests/IFixPatch.Decompiler.Tests.csproj" />
+  </Folder>
+  <Folder Name="/IFixPatch.Recompiler/">
+    <Project Path="IFixPatch.Recompiler/IFixPatch.Recompiler.csproj" />
+    <Project Path="IFixPatch.Recompiler/tests/IFixPatch.Recompiler.Tests.csproj" />
+  </Folder>
+  <Folder Name="/IFixPatch.SourceBuilder.Core/">
+    <Project Path="IFixPatch.SourceBuilder.Core/IFixPatch.SourceBuilder.Core.csproj" />
+    <Project Path="IFixPatch.SourceBuilder.Core/tests/IFixPatch.SourceBuilder.Core.Tests.csproj" />
+  </Folder>
+  <Folder Name="/IFixPatch.SourceBuilder/">
+    <Project Path="IFixPatch.SourceBuilder/IFixPatch.SourceBuilder.csproj" />
+    <Project Path="IFixPatch.SourceBuilder/tests/IFixPatch.SourceBuilder.Tests.csproj" />
+  </Folder>
+</Solution>

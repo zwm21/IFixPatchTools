@@ -28,6 +28,14 @@ dotnet build IFixPatch.SourceBuilder -c Release
 SourceBuilder 生成补丁还需要目标版本的元数据和指定版本的 InjectFix 源码，
 见 [SourceBuilder 使用说明](IFixPatch.SourceBuilder/README.md)。
 
+各程序集的单元测试位于各自的 `tests/` 子目录，统一执行：
+
+```bash
+dotnet test IFixPatchTools.slnx -c Release
+```
+
+测试使用自建输入，无需游戏文件或 InjectFix 源码；详细范围见 [贡献说明](CONTRIBUTING.md#构建与验证)。
+
 ## 快速开始
 
 不需要游戏文件的示例见 [samples/roundtrip](samples/roundtrip/README.md)。
